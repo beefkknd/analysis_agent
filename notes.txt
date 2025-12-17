@@ -1,0 +1,3433 @@
+so i want make an business intelligence agent using langgraph and i want idea on manager state/checkpoint/memory. So i will use elasticsearch and Graphql to build query and then fetch data. Now i have a decision to make. Can i make my query_builder_agent an agent, and wrap it as a MCP tool. If i do, i believe my query_build_agent will be stateless. If my query_build_agent need clarification, the execution flow need exit the tool call, which then make this 1 complete chat_turn. Another choice is, make this entire flow as 1 agent, and tool is  then say vectorDB_tool, es_query_exec_tool balh blah blah. which direction i should go? for now, i am implementing the data retrieval part and down the road i may have analysis_tools
+
+2:16 PM
+This is a great architectural question! Let me break down the tradeoffs:
+
+The Core Tradeoff
+Option 1: Query Builder as MCP Tool (Nested Agent)
+
+Query builder is a separate stateful agent
+Main agent calls it as a tool
+When clarification needed → tool returns, full chat turn completes
+User responds → new turn → tool called again
+Option 2: Monolithic Agent with Tools
+
+Single agent with query_builder as an internal node
+Tools are atomic: vector_search, es_query_exec, graphql_exec
+Agent can loop internally for clarification without exiting
+My Recommendation: Option 2 (Single Agent Architecture)
+Here's why this fits your use case better:
+
+1. Conversation Flow Control
+Your BI agent needs tight control over the clarification loop:
+
+python
+# With monolithic agent:
+User: "Show me shipments"
+Agent: query_builder_node → needs clarification
+Agent: generate_response_node → "Which time period?"
+User: "Last week"  
+Agent: query_builder_node → builds query
+Agent: es_query_exec_tool → fetches data
+Agent: format_response_node → returns results
+
+# With MCP tool approach:
+User: "Show me shipments"
+Agent: calls query_builder_tool
+Tool: returns "NEED_CLARIFICATION: time_period"
+Agent: exits, returns to user
+User: "Last week"
+Agent: calls query_builder_tool AGAIN (loses context?)
+2. State Management is Cleaner
+python
+class BIAgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    query_context: dict  # parsed intent, entities, constraints
+    clarification_needed: list[str]
+    query_draft: dict  # ES/GraphQL query being built
+    results: dict
+    analysis_context: dict  # for future analysis tools
+You keep everything in one state object that flows through nodes. With nested agents, you'd need careful checkpoint coordination.
+
+3. Future Analysis Tools Fit Naturally
+python
+graph = StateGraph(BIAgentState)
+
+# Data retrieval phase
+graph.add_node("classify_intent", classify_node)
+graph.add_node("extract_entities", entity_node)
+graph.add_node("build_query", query_builder_node)
+graph.add_node("execute_query", query_exec_node)
+
+# Analysis phase (future)
+graph.add_node("analyze_data", analysis_node)  
+graph.add_node("generate_viz", viz_node)
+
+# Routing logic
+graph.add_conditional_edges(
+    "build_query",
+    should_clarify,
+    {
+        "clarify": "generate_response",
+        "execute": "execute_query"
+    }
+)
+4. Checkpointing Works Smoothly
+With a single agent, checkpoints capture the entire conversation state at each turn. You can resume mid-query-building if needed. With MCP tools as nested agents, you'd need to coordinate checkpoints across agent boundaries.
+
+When MCP Tool Approach WOULD Make Sense
+Use nested agents/MCP tools when:
+
+Independent workflows: Query builder used by multiple different agents
+Different deployment contexts: Query builder runs elsewhere (different permissions, resources)
+True isolation: You want query building completely decoupled
+But for your BI agent where query building is tightly coupled to the conversation flow, keep it as nodes in one graph.
+
+Suggested Node Structure
+python
+graph = StateGraph(BIAgentState)
+
+# Conversation/Intent nodes
+graph.add_node("parse_intent", parse_intent_node)
+graph.add_node("extract_entities", extract_entities_node) 
+
+# Query building nodes
+graph.add_node("draft_query", draft_query_node)
+graph.add_node("validate_query", validate_query_node)
+
+# Execution tools (these CAN be MCP tools if useful)
+graph.add_node("vector_search", call_tool_node)  # MCP: vector DB
+graph.add_node("execute_es", call_tool_node)      # MCP: ES
+graph.add_node("execute_graphql", call_tool_node) # MCP: GraphQL
+
+# Response nodes
+graph.add_node("format_results", format_node)
+graph.add_node("generate_response", llm_response_node)
+MCP tools for the actual data sources (ES, GraphQL, vector DB) make sense because they're stateless operations. But the orchestration logic stays in your agent.
+
+Does this align with your architecture thinking? Happy to dive deeper into state schema or routing logic if helpful!
+
+so one agent with all the nodes, then i need some thoughts to organize the nodes/state etc so easy maintain and expand then, if they are not self contained.
+
+2:18 PM
+Great question! Here's how to organize a complex LangGraph agent for maintainability and expansion:
+
+1. Domain-Driven Node Organization
+Structure your codebase by concern, not by "all nodes in one file":
+
+bi_agent/
+├── graph.py                 # Graph assembly only
+├── state.py                 # State schema
+├── nodes/
+│   ├── __init__.py
+│   ├── intent/              # Intent understanding phase
+│   │   ├── classifier.py
+│   │   ├── entity_extractor.py
+│   │   └── context_enricher.py
+│   ├── query/               # Query building phase
+│   │   ├── query_planner.py
+│   │   ├── es_builder.py
+│   │   ├── graphql_builder.py
+│   │   └── validator.py
+│   ├── execution/           # Data fetching phase
+│   │   ├── es_executor.py
+│   │   ├── graphql_executor.py
+│   │   └── result_merger.py
+│   ├── analysis/            # Future: analysis phase
+│   │   ├── aggregator.py
+│   │   └── trend_analyzer.py
+│   └── response/            # Response generation phase
+│       ├── formatter.py
+│       └── generator.py
+├── routing/
+│   ├── __init__.py
+│   ├── intent_router.py
+│   └── clarification_router.py
+└── tools/
+    ├── vector_search.py
+    ├── es_client.py
+    └── graphql_client.py
+2. Hierarchical State Schema
+Use nested TypedDicts to organize state by phase:
+
+python
+# state.py
+from typing import TypedDict, Annotated, Literal
+from langgraph.graph import add_messages
+
+class IntentContext(TypedDict):
+    """What the user wants"""
+    intent_type: Literal["lookup", "aggregation", "comparison", "trend"]
+    confidence: float
+    entities: dict[str, list[str]]  # {"vessel": ["MSC ANNA"], "port": ["SHANGHAI"]}
+    time_range: dict | None
+    requires_clarification: list[str]
+
+class QueryContext(TypedDict):
+    """Query being built"""
+    query_type: Literal["elasticsearch", "graphql", "hybrid"]
+    es_query: dict | None
+    graphql_query: str | None
+    query_plan: dict  # execution strategy
+    validation_errors: list[str]
+    
+class ExecutionContext(TypedDict):
+    """Query execution results"""
+    raw_results: dict
+    record_count: int
+    execution_time_ms: float
+    data_sources_used: list[str]
+    
+class AnalysisContext(TypedDict):
+    """Future: analysis state"""
+    aggregations: dict
+    trends: list[dict]
+    insights: list[str]
+
+class BIAgentState(TypedDict):
+    """Root state - only top-level concerns here"""
+    messages: Annotated[list, add_messages]
+    
+    # Phase-specific contexts
+    intent: IntentContext
+    query: QueryContext
+    execution: ExecutionContext
+    analysis: AnalysisContext
+    
+    # Workflow metadata
+    current_phase: Literal["intent", "query", "execution", "analysis", "response"]
+    iteration_count: int
+    error: str | None
+Why this works:
+
+Each node only touches its relevant context subset
+Easy to add new phases (just add a new TypedDict)
+Clear data ownership boundaries
+3. Node Pattern: Read Narrow, Write Narrow
+Each node should follow this pattern:
+
+python
+# nodes/query/es_builder.py
+from bi_agent.state import BIAgentState, QueryContext
+
+def build_es_query(state: BIAgentState) -> dict:
+    """
+    Inputs: state.intent (read only)
+    Outputs: state.query.es_query, state.query.query_plan
+    """
+    intent = state["intent"]
+    
+    # Build query based on intent
+    es_query = {
+        "query": {
+            "bool": {
+                "must": _build_must_clauses(intent["entities"]),
+                "filter": _build_time_filter(intent["time_range"])
+            }
+        }
+    }
+    
+    # Return ONLY what you're modifying
+    return {
+        "query": {
+            "es_query": es_query,
+            "query_type": "elasticsearch",
+            "query_plan": {"estimated_records": 1000}
+        }
+    }
+
+def _build_must_clauses(entities: dict) -> list:
+    """Helper: pure function, easy to test"""
+    clauses = []
+    if "vessel" in entities:
+        clauses.append({"terms": {"vessel_name": entities["vessel"]}})
+    return clauses
+Key principles:
+
+Node only reads what it needs
+Returns dict with nested updates (LangGraph merges automatically)
+Helper functions are pure, testable
+Docstring documents input/output state keys
+4. Routing as Separate Concerns
+Keep routing logic out of nodes:
+
+python
+# routing/intent_router.py
+from bi_agent.state import BIAgentState
+
+def route_after_intent(state: BIAgentState) -> str:
+    """Route based on intent classification results"""
+    intent = state["intent"]
+    
+    if intent["requires_clarification"]:
+        return "clarification"
+    
+    if intent["intent_type"] in ["lookup", "aggregation"]:
+        return "build_query"
+    
+    if intent["intent_type"] == "comparison":
+        return "multi_query_planner"
+    
+    return "build_query"  # default
+
+def should_replan_query(state: BIAgentState) -> str:
+    """Route based on query validation"""
+    query = state["query"]
+    
+    if query["validation_errors"]:
+        return "query_planner"  # rebuild
+    
+    if query["query_plan"]["estimated_records"] > 10000:
+        return "optimize_query"
+    
+    return "execute"
+5. Graph Assembly - Declarative
+Your graph.py becomes a readable map of your workflow:
+
+python
+# graph.py
+from langgraph.graph import StateGraph, END
+from bi_agent.state import BIAgentState
+from bi_agent.nodes.intent import classify_intent, extract_entities
+from bi_agent.nodes.query import build_es_query, validate_query
+from bi_agent.nodes.execution import execute_es_query
+from bi_agent.nodes.response import format_response, generate_response
+from bi_agent.routing import route_after_intent, should_replan_query
+
+def create_bi_agent():
+    graph = StateGraph(BIAgentState)
+    
+    # === INTENT PHASE ===
+    graph.add_node("classify_intent", classify_intent)
+    graph.add_node("extract_entities", extract_entities)
+    
+    # === QUERY PHASE ===
+    graph.add_node("build_es_query", build_es_query)
+    graph.add_node("validate_query", validate_query)
+    graph.add_node("optimize_query", optimize_query)
+    
+    # === EXECUTION PHASE ===
+    graph.add_node("execute_es", execute_es_query)
+    
+    # === RESPONSE PHASE ===
+    graph.add_node("format_response", format_response)
+    graph.add_node("generate_response", generate_response)
+    
+    # === EDGES ===
+    graph.set_entry_point("classify_intent")
+    graph.add_edge("classify_intent", "extract_entities")
+    
+    graph.add_conditional_edges(
+        "extract_entities",
+        route_after_intent,
+        {
+            "clarification": "generate_response",
+            "build_query": "build_es_query",
+            "multi_query_planner": "multi_query_planner"
+        }
+    )
+    
+    graph.add_edge("build_es_query", "validate_query")
+    
+    graph.add_conditional_edges(
+        "validate_query",
+        should_replan_query,
+        {
+            "query_planner": "build_es_query",
+            "optimize_query": "optimize_query",
+            "execute": "execute_es"
+        }
+    )
+    
+    graph.add_edge("execute_es", "format_response")
+    graph.add_edge("format_response", "generate_response")
+    graph.add_edge("generate_response", END)
+    
+    return graph.compile(checkpointer=...)
+6. Expansion Strategy
+When adding analysis tools later:
+
+python
+# Just add new nodes
+graph.add_node("aggregate_data", aggregate_data)
+graph.add_node("detect_trends", detect_trends)
+
+# Insert into flow
+graph.add_conditional_edges(
+    "execute_es",
+    needs_analysis,
+    {
+        "analyze": "aggregate_data",
+        "format": "format_response"
+    }
+)
+
+graph.add_edge("aggregate_data", "detect_trends")
+graph.add_edge("detect_trends", "format_response")
+State already has AnalysisContext - just populate it!
+
+7. Testing Strategy
+python
+# tests/test_query_builder.py
+def test_es_builder_simple_lookup():
+    state = {
+        "intent": {
+            "intent_type": "lookup",
+            "entities": {"vessel": ["MSC ANNA"]},
+            "time_range": None,
+            "requires_clarification": []
+        },
+        "query": {}
+    }
+    
+    result = build_es_query(state)
+    
+    assert result["query"]["es_query"]["query"]["bool"]["must"][0] == {
+        "terms": {"vessel_name": ["MSC ANNA"]}
+    }
+Each node is independently testable!
+
+Key Takeaways
+Organize by domain/phase, not by "type of code"
+Nested state schema maps to your workflow phases
+Nodes read narrow, write narrow - document inputs/outputs
+Routing logic is separate from business logic
+Graph assembly is declarative - easy to visualize
+Expansion is additive - insert new nodes without breaking existing ones
+Want me to elaborate on any of these patterns?
+
+now, i will need expose these 'executor' type as real stateless tool down the road. incorporate this and refine your design and do not code
+
+2:20 PM
+Excellent point! Let me refine the architecture to cleanly separate orchestration nodes from stateless execution tools.
+
+Revised Architecture: Nodes vs Tools
+Core Distinction
+Nodes = Stateful orchestration logic (reads/writes state, makes decisions) Tools = Stateless operations (given inputs → return outputs, no state access)
+
+1. Refined Directory Structure
+bi_agent/
+├── graph.py                 # Graph assembly
+├── state.py                 # State schema
+├── nodes/                   # ORCHESTRATION - stateful
+│   ├── intent/
+│   │   ├── classifier.py         # Calls LLM, updates state.intent
+│   │   ├── entity_extractor.py   # Calls LLM, updates state.intent.entities
+│   │   └── context_enricher.py   # Enriches from vector DB
+│   ├── query/
+│   │   ├── query_planner.py      # Decides ES vs GraphQL vs hybrid
+│   │   ├── query_builder.py      # Orchestrates building, calls tools
+│   │   ├── query_optimizer.py    # Refines queries based on estimates
+│   │   └── validator.py          # Validates query structure
+│   ├── execution/
+│   │   ├── executor_node.py      # WRAPPER: calls tools, handles errors
+│   │   └── result_merger.py      # Merges multi-source results
+│   ├── analysis/
+│   │   ├── aggregator_node.py    # Orchestrates aggregation logic
+│   │   └── insight_generator.py  # Generates insights from data
+│   └── response/
+│       ├── formatter.py          # Formats data for presentation
+│       └── generator.py          # LLM generates natural language
+│
+├── tools/                   # EXECUTION - stateless, reusable
+│   ├── __init__.py
+│   ├── registry.py               # Tool registration/discovery
+│   ├── data_sources/
+│   │   ├── es_executor.py        # Pure ES query execution
+│   │   ├── graphql_executor.py   # Pure GraphQL execution
+│   │   └── vector_search.py      # Pure vector similarity search
+│   ├── query_builders/           # Pure query construction
+│   │   ├── es_query_builder.py   # Intent dict → ES query dict
+│   │   ├── graphql_builder.py    # Intent dict → GraphQL string
+│   │   └── sql_builder.py        # Future: SQL support
+│   ├── analysis/                 # Future: stateless analysis operations
+│   │   ├── aggregator.py         # Perform aggregations on data
+│   │   ├── trend_detector.py     # Detect trends in timeseries
+│   │   └── outlier_detector.py   # Statistical outlier detection
+│   └── formatters/               # Data transformation
+│       ├── table_formatter.py
+│       ├── chart_data_prep.py
+│       └── export_formatter.py
+│
+├── mcp_server/              # MCP exposure layer
+│   ├── server.py                 # MCP server setup
+│   ├── tool_adapters/            # Wrap internal tools for MCP
+│   │   ├── es_adapter.py
+│   │   ├── graphql_adapter.py
+│   │   └── analysis_adapter.py
+│   └── schemas/                  # MCP tool schemas
+│       └── tool_definitions.json
+│
+└── routing/
+    ├── intent_router.py
+    ├── execution_router.py
+    └── clarification_router.py
+2. Clean Tool Interface Pattern
+All tools follow this contract:
+
+python
+# tools/data_sources/es_executor.py
+
+class ESExecutorTool:
+    """
+    Stateless Elasticsearch query executor.
+    
+    Input: ES query dict + execution config
+    Output: Results dict + metadata
+    No state access, no side effects (except ES call)
+    """
+    
+    def __init__(self, es_client):
+        self.client = es_client
+    
+    def execute(
+        self, 
+        query: dict,
+        index: str,
+        timeout_ms: int = 30000,
+        max_results: int = 1000
+    ) -> dict:
+        """
+        Pure execution function - can be called from:
+        - LangGraph node
+        - MCP tool
+        - Direct API call
+        - Unit test
+        """
+        # Execute query
+        # Return standardized result format
+        return {
+            "hits": [...],
+            "total": 1234,
+            "took_ms": 45,
+            "timed_out": False
+        }
+python
+# tools/query_builders/es_query_builder.py
+
+class ESQueryBuilderTool:
+    """
+    Stateless ES query builder.
+    
+    Input: Intent structure (entities, time range, filters)
+    Output: ES query dict
+    """
+    
+    def build(
+        self,
+        intent_type: str,
+        entities: dict,
+        time_range: dict | None,
+        filters: list[dict] = None,
+        aggregations: list[str] = None
+    ) -> dict:
+        """
+        Pure function: intent params → ES query
+        No state, no LLM calls, just query construction
+        """
+        # Build ES query structure
+        return {
+            "query": {...},
+            "aggs": {...} if aggregations else None,
+            "size": 1000
+        }
+3. Node Pattern: Orchestrator That Calls Tools
+Nodes orchestrate, tools execute:
+
+python
+# nodes/execution/executor_node.py
+
+from bi_agent.state import BIAgentState
+from bi_agent.tools.data_sources import es_executor, graphql_executor
+
+def execute_query_node(state: BIAgentState) -> dict:
+    """
+    Orchestration node: 
+    - Reads state.query (what to execute)
+    - Calls appropriate tool(s)
+    - Writes state.execution (results)
+    - Handles errors, retries, timeouts
+    """
+    
+    query_ctx = state["query"]
+    
+    try:
+        if query_ctx["query_type"] == "elasticsearch":
+            # Call stateless tool
+            results = es_executor.execute(
+                query=query_ctx["es_query"],
+                index="shipments",
+                timeout_ms=30000
+            )
+            
+        elif query_ctx["query_type"] == "graphql":
+            results = graphql_executor.execute(
+                query=query_ctx["graphql_query"],
+                variables=query_ctx.get("variables", {})
+            )
+            
+        elif query_ctx["query_type"] == "hybrid":
+            # Orchestrate multiple tool calls
+            es_results = es_executor.execute(...)
+            gql_results = graphql_executor.execute(...)
+            results = _merge_results(es_results, gql_results)
+        
+        return {
+            "execution": {
+                "raw_results": results,
+                "record_count": results["total"],
+                "execution_time_ms": results["took_ms"],
+                "data_sources_used": [query_ctx["query_type"]]
+            },
+            "error": None
+        }
+        
+    except TimeoutError:
+        return {
+            "error": "Query execution timed out",
+            "current_phase": "error_handling"
+        }
+python
+# nodes/query/query_builder.py
+
+from bi_agent.state import BIAgentState
+from bi_agent.tools.query_builders import es_query_builder, graphql_builder
+
+def build_query_node(state: BIAgentState) -> dict:
+    """
+    Orchestration node:
+    - Reads state.intent (what user wants)
+    - Calls builder tool(s)
+    - Writes state.query (constructed queries)
+    - May call LLM for complex translations
+    """
+    
+    intent = state["intent"]
+    
+    # For simple cases, use pure builder tool
+    if intent["intent_type"] in ["lookup", "simple_aggregation"]:
+        es_query = es_query_builder.build(
+            intent_type=intent["intent_type"],
+            entities=intent["entities"],
+            time_range=intent["time_range"]
+        )
+        
+        return {
+            "query": {
+                "query_type": "elasticsearch",
+                "es_query": es_query,
+                "query_plan": {"strategy": "direct"}
+            }
+        }
+    
+    # For complex cases, use LLM + tool
+    else:
+        # Call LLM to break down complex intent
+        # Then use builder tools for each sub-query
+        ...
+4. MCP Exposure Layer
+Tools are exposed via MCP with thin adapters:
+
+python
+# mcp_server/tool_adapters/es_adapter.py
+
+from bi_agent.tools.data_sources.es_executor import ESExecutorTool
+
+def create_es_mcp_tool(es_client):
+    """Wrap internal tool for MCP exposure"""
+    
+    tool = ESExecutorTool(es_client)
+    
+    return {
+        "name": "elasticsearch_query",
+        "description": "Execute Elasticsearch query and return results",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "object", "description": "ES query DSL"},
+                "index": {"type": "string", "description": "Index name"},
+                "timeout_ms": {"type": "integer", "default": 30000},
+                "max_results": {"type": "integer", "default": 1000}
+            },
+            "required": ["query", "index"]
+        },
+        "handler": tool.execute  # Direct passthrough!
+    }
+5. Dual Usage Pattern
+Your tools can now be used in three ways:
+
+A. Internal (LangGraph nodes call tools)
+python
+# Inside node
+results = es_executor.execute(query=es_query, index="shipments")
+B. External MCP (Other agents call via MCP)
+python
+# Another agent using your MCP server
+result = await mcp_client.call_tool(
+    "elasticsearch_query",
+    query={...},
+    index="shipments"
+)
+C. Direct API (REST endpoint bypassing agent)
+python
+# Direct HTTP call for power users
+POST /api/tools/elasticsearch/execute
+{
+  "query": {...},
+  "index": "shipments"
+}
+6. Refined State Schema
+State now clearly separates orchestration context from tool inputs/outputs:
+
+python
+class QueryContext(TypedDict):
+    """Orchestration state for query building"""
+    query_type: Literal["elasticsearch", "graphql", "hybrid"]
+    
+    # Tool inputs (prepared by orchestration)
+    es_query: dict | None           # Input for es_executor tool
+    graphql_query: str | None       # Input for graphql_executor tool
+    execution_config: dict          # Timeout, limits, etc.
+    
+    # Orchestration metadata
+    query_plan: dict                # How to execute (parallel, sequential, etc.)
+    optimization_applied: bool
+    validation_errors: list[str]
+    
+class ExecutionContext(TypedDict):
+    """Tool outputs (results from execution)"""
+    raw_results: dict               # Output from executor tools
+    record_count: int
+    execution_time_ms: float
+    data_sources_used: list[str]
+    
+    # Orchestration metadata
+    retry_count: int
+    cache_hit: bool
+7. Benefits of This Design
+For Maintainability:
+Clear boundaries: Nodes orchestrate, tools execute
+Tools are testable: Pure functions, no state dependency
+Easy to mock: Replace tool in node for testing
+For Expansion:
+Add new data sources: Just create new tool + adapter
+Add new analysis: Pure analysis tools + orchestrator nodes
+Tool composition: Nodes can combine multiple tools
+For Reusability:
+MCP exposure: Tools automatically available to other agents
+Direct API: Power users can bypass agent for raw tool access
+Library usage: Tools can be imported in non-LangGraph code
+8. Tool Registry for Discovery
+python
+# tools/registry.py
+
+class ToolRegistry:
+    """Central registry for all tools"""
+    
+    def __init__(self):
+        self._tools = {}
+    
+    def register(self, category: str, tool_name: str, tool_instance):
+        """Register tool for internal + MCP use"""
+        self._tools[f"{category}.{tool_name}"] = tool_instance
+    
+    def get(self, full_name: str):
+        """Get tool for node usage"""
+        return self._tools[full_name]
+    
+    def list_for_mcp(self) -> list[dict]:
+        """Generate MCP tool definitions"""
+        return [
+            create_mcp_definition(name, tool)
+            for name, tool in self._tools.items()
+        ]
+
+# Usage
+registry = ToolRegistry()
+registry.register("data_sources", "elasticsearch", ESExecutorTool(es_client))
+registry.register("data_sources", "graphql", GraphQLExecutorTool(gql_client))
+registry.register("analysis", "aggregator", AggregatorTool())
+9. Migration Path
+Phase 1 (Now): Build tools as internal functions in nodes Phase 2: Extract pure execution logic into tool classes Phase 3: Add MCP adapters for external exposure Phase 4: Add direct API endpoints for power users
+
+Each phase is additive, no breaking changes!
+
+Summary
+Nodes = Orchestration logic (stateful, complex, LLM calls, decision making) Tools = Execution units (stateless, pure, reusable, testable, MCP-exposable)
+
+Your executor functions become first-class tools that can be:
+
+Called from LangGraph nodes (internal orchestration)
+Exposed via MCP (external agents)
+Called via direct API (power users)
+Tested independently (unit tests)
+Does this separation feel right for your BI agent architecture?
+
+okay, refine this design, my current agent run entity_name_resolution use llm_tool, and it then do lookup use vectordb_tool, and i also has an embedding_tool so any to do with embedding is using it. I also has a config folder of Settings, which load env stuff. And i also have a prompt.yaml file need be loaded somewhere. Plus i need a folder for domain object, AgentState, conversationTurn, memory. for  tools, how to make tool adapt to MCP and run locally for now? is registry.py is just for local? update your directory structure with your design. Also i still not clear yet, is, when is consider as a 1 conversation_turn, is it considered as say, after i typed my question and hit enter, till i see response, this is 1 conversation_turn. Or, if running agent in the middle and agent want ask for clarification to continue, what is a conversation turn. I can support short-term memory for now, so i can extra last round of conversation_turn. but chathistory or conversation_turn or memory, i need a clean design
+
+Show more
+3:14 PM
+Excellent questions! Let me refine the complete architecture with all your components and clarify the conversation turn semantics.
+
+1. Conversation Turn Semantics - Critical Distinction
+Definition of Conversation Turn:
+1 Conversation Turn = User Input → Agent Processing (may include internal loops) → Final Response to User
+
+Example 1: Simple flow (1 turn)
+User: "Show me shipments for MSC ANNA"
+  → Agent: classify → extract entities → resolve names → build query → execute → respond
+User sees: "Here are 5 shipments..."
+✓ This is 1 complete turn
+
+Example 2: Clarification needed (still 1 turn!)
+User: "Show me shipments"
+  → Agent: classify → needs clarification → generates clarification question
+User sees: "Which vessel or time period?"
+✓ This is 1 complete turn (agent decided to ask for clarification)
+
+User: "Last week"
+  → Agent: classify → extract entities → build query → execute → respond
+User sees: "Here are 150 shipments from last week..."
+✓ This is another complete turn
+
+Example 3: Internal agent loops (1 turn)
+User: "Show me shipments for Anna"
+  → Agent: classify → extract "Anna" → resolve (ambiguous!) → vector search → 
+           LLM chooses "MSC ANNA" → build query → execute → respond
+User sees: "Here are 5 shipments for MSC ANNA..."
+✓ Still 1 turn - user never saw the internal ambiguity resolution
+Key insight: Agent asking for clarification = agent CHOSE to end the turn and return control to user. Internal loops (entity resolution, query refinement) happen WITHIN a turn.
+
+When does a turn end?
+Agent returns a message to user (answer, clarification question, error)
+Agent hits END node in graph
+Agent decides it needs user input to proceed
+Checkpoint timing:
+After each turn completes (before waiting for next user input)
+Checkpoint captures: all state, conversation history, intermediate results
+2. Complete Directory Structure
+bi_agent/
+├── config/
+│   ├── __init__.py
+│   ├── settings.py              # Settings class (loads env)
+│   ├── prompts.yaml             # All prompt templates
+│   └── tool_config.yaml         # Tool configurations
+│
+├── domain/                      # Domain objects & state
+│   ├── __init__.py
+│   ├── state.py                 # AgentState TypedDict
+│   ├── conversation.py          # ConversationTurn, Message classes
+│   ├── memory.py                # ShortTermMemory, MemoryManager
+│   ├── query.py                 # Query domain objects
+│   └── entities.py              # Entity domain objects
+│
+├── tools/                       # Stateless execution tools
+│   ├── __init__.py
+│   ├── registry.py              # Local tool registry + MCP adapter factory
+│   ├── base.py                  # BaseTool interface
+│   │
+│   ├── llm/
+│   │   └── llm_tool.py          # LLM calls (completion, structured output)
+│   │
+│   ├── embedding/
+│   │   └── embedding_tool.py    # Text → embeddings (local & remote)
+│   │
+│   ├── vector/
+│   │   └── vectordb_tool.py     # Vector search operations
+│   │
+│   ├── data_sources/
+│   │   ├── es_executor.py       # Elasticsearch execution
+│   │   └── graphql_executor.py  # GraphQL execution
+│   │
+│   ├── query_builders/
+│   │   ├── es_builder.py        # ES query construction
+│   │   └── graphql_builder.py   # GraphQL query construction
+│   │
+│   └── adapters/                # Tool execution adapters
+│       ├── local_adapter.py     # Run tool locally (direct call)
+│       └── mcp_adapter.py       # Run tool via MCP (future)
+│
+├── nodes/                       # Stateful orchestration nodes
+│   ├── __init__.py
+│   │
+│   ├── intent/
+│   │   ├── classifier.py        # Uses llm_tool
+│   │   └── entity_extractor.py  # Uses llm_tool
+│   │
+│   ├── resolution/
+│   │   └── entity_resolver.py   # Uses llm_tool + vectordb_tool + embedding_tool
+│   │
+│   ├── query/
+│   │   ├── query_planner.py     # Uses llm_tool
+│   │   ├── query_builder.py     # Uses es_builder/graphql_builder tools
+│   │   └── validator.py
+│   │
+│   ├── execution/
+│   │   ├── executor_node.py     # Uses es_executor/graphql_executor tools
+│   │   └── result_merger.py
+│   │
+│   └── response/
+│       ├── formatter.py
+│       └── generator.py         # Uses llm_tool
+│
+├── memory/                      # Memory management
+│   ├── __init__.py
+│   ├── manager.py               # MemoryManager (loads/saves state)
+│   ├── short_term.py            # ShortTermMemory implementation
+│   └── checkpointer.py          # LangGraph checkpointer wrapper
+│
+├── routing/
+│   ├── __init__.py
+│   ├── intent_router.py
+│   ├── execution_router.py
+│   └── clarification_router.py
+│
+├── graph.py                     # Graph assembly
+├── agent.py                     # Agent entry point (run_turn method)
+│
+└── mcp_server/                  # MCP exposure (future)
+    ├── server.py
+    └── tool_registry.py         # Generates MCP tool list from registry
+3. Domain Objects - Clean Separation
+python
+# domain/conversation.py
+
+from datetime import datetime
+from typing import Literal
+from pydantic import BaseModel
+
+class Message(BaseModel):
+    """Single message in conversation"""
+    role: Literal["user", "assistant", "system"]
+    content: str
+    timestamp: datetime
+    metadata: dict = {}
+
+class ConversationTurn(BaseModel):
+    """
+    One complete user → agent → response cycle.
+    This is the unit of memory we track.
+    """
+    turn_id: int
+    user_message: Message
+    agent_response: Message
+    
+    # What happened during this turn
+    intent_detected: str
+    entities_extracted: dict
+    queries_executed: list[dict]
+    
+    # Metadata
+    started_at: datetime
+    completed_at: datetime
+    tokens_used: int
+    
+    def to_context_string(self) -> str:
+        """Format for short-term memory context"""
+        return f"User: {self.user_message.content}\nAssistant: {self.agent_response.content}"
+python
+# domain/memory.py
+
+from typing import Protocol
+from domain.conversation import ConversationTurn
+
+class MemoryProtocol(Protocol):
+    """Interface for memory implementations"""
+    
+    def add_turn(self, turn: ConversationTurn) -> None:
+        """Add completed turn to memory"""
+        ...
+    
+    def get_recent_context(self, n: int = 1) -> str:
+        """Get last N turns as context string"""
+        ...
+    
+    def clear(self) -> None:
+        """Clear memory"""
+        ...
+
+class ShortTermMemory:
+    """
+    Keeps last N conversation turns in memory.
+    This is what gets injected into prompts as context.
+    """
+    
+    def __init__(self, max_turns: int = 3):
+        self.max_turns = max_turns
+        self.turns: list[ConversationTurn] = []
+    
+    def add_turn(self, turn: ConversationTurn) -> None:
+        """Add turn, evict oldest if over limit"""
+        self.turns.append(turn)
+        if len(self.turns) > self.max_turns:
+            self.turns.pop(0)
+    
+    def get_recent_context(self, n: int = 1) -> str:
+        """Get last N turns formatted for prompt context"""
+        recent = self.turns[-n:] if n <= len(self.turns) else self.turns
+        return "\n\n".join(turn.to_context_string() for turn in recent)
+    
+    def get_last_turn(self) -> ConversationTurn | None:
+        """Get most recent turn"""
+        return self.turns[-1] if self.turns else None
+python
+# domain/state.py
+
+from typing import TypedDict, Annotated
+from langgraph.graph import add_messages
+from domain.conversation import ConversationTurn
+from domain.memory import ShortTermMemory
+
+class IntentContext(TypedDict):
+    intent_type: str
+    confidence: float
+    entities: dict[str, list[str]]
+    requires_clarification: list[str]
+
+class ResolutionContext(TypedDict):
+    """Entity resolution state"""
+    unresolved_entities: dict[str, list[str]]  # {"vessel": ["Anna"]}
+    resolved_entities: dict[str, list[dict]]    # {"vessel": [{"name": "MSC ANNA", "imo": "..."}]}
+    ambiguous_entities: dict[str, list[dict]]   # Multiple matches
+    resolution_metadata: dict
+
+class QueryContext(TypedDict):
+    query_type: str
+    es_query: dict | None
+    graphql_query: str | None
+    query_plan: dict
+
+class ExecutionContext(TypedDict):
+    raw_results: dict
+    record_count: int
+    execution_time_ms: float
+
+class BIAgentState(TypedDict):
+    """
+    Root agent state - persisted at checkpoints.
+    Represents state WITHIN a single conversation turn.
+    """
+    
+    # LangGraph message history (for this turn)
+    messages: Annotated[list, add_messages]
+    
+    # Current turn being processed
+    current_turn_id: int
+    user_input: str
+    
+    # Phase-specific contexts (for this turn)
+    intent: IntentContext
+    resolution: ResolutionContext
+    query: QueryContext
+    execution: ExecutionContext
+    
+    # Memory reference (not serialized, injected at runtime)
+    # This is the SHORT TERM memory across turns
+    memory: ShortTermMemory | None
+    
+    # Workflow metadata (for this turn)
+    current_phase: str
+    iteration_count: int
+    error: str | None
+    
+    # Final output (for this turn)
+    agent_response: str | None
+4. Tool Design - Local + MCP Ready
+python
+# tools/base.py
+
+from abc import ABC, abstractmethod
+from typing import Any, TypeVar
+from pydantic import BaseModel
+
+T = TypeVar('T')
+
+class ToolResult(BaseModel):
+    """Standardized tool output"""
+    success: bool
+    data: Any
+    error: str | None = None
+    metadata: dict = {}
+
+class BaseTool(ABC):
+    """
+    Base interface for all tools.
+    Tools are stateless - they don't access AgentState.
+    """
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tool name for registration"""
+        pass
+    
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Tool description for MCP/LLM"""
+        pass
+    
+    @abstractmethod
+    def input_schema(self) -> dict:
+        """JSON schema for tool inputs (MCP compatible)"""
+        pass
+    
+    @abstractmethod
+    def execute(self, **kwargs) -> ToolResult:
+        """Execute tool with given inputs"""
+        pass
+python
+# tools/embedding/embedding_tool.py
+
+from tools.base import BaseTool, ToolResult
+from config.settings import Settings
+
+class EmbeddingTool(BaseTool):
+    """
+    Stateless embedding tool.
+    Works locally now, can be MCP-exposed later.
+    """
+    
+    def __init__(self, settings: Settings):
+        self.model = settings.embedding_model
+        self.provider = settings.embedding_provider  # "openai" or "local"
+        
+        if self.provider == "local":
+            # Load local model
+            self._client = self._init_local_model()
+        else:
+            # Use API
+            self._client = self._init_api_client()
+    
+    @property
+    def name(self) -> str:
+        return "embedding"
+    
+    @property
+    def description(self) -> str:
+        return "Generate embeddings for text using configured model"
+    
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "Text to embed"},
+                "normalize": {"type": "boolean", "default": True}
+            },
+            "required": ["text"]
+        }
+    
+    def execute(self, text: str, normalize: bool = True) -> ToolResult:
+        """Generate embedding - works same whether local or MCP"""
+        try:
+            if self.provider == "local":
+                embedding = self._client.encode(text, normalize_embeddings=normalize)
+            else:
+                embedding = self._client.embeddings.create(
+                    input=text, 
+                    model=self.model
+                ).data[0].embedding
+            
+            return ToolResult(
+                success=True,
+                data=embedding,
+                metadata={"model": self.model, "dim": len(embedding)}
+            )
+        except Exception as e:
+            return ToolResult(success=False, data=None, error=str(e))
+python
+# tools/vector/vectordb_tool.py
+
+from tools.base import BaseTool, ToolResult
+
+class VectorDBTool(BaseTool):
+    """
+    Stateless vector search tool.
+    Can use embedding_tool internally or receive embeddings.
+    """
+    
+    def __init__(self, vector_db_client, embedding_tool: 'EmbeddingTool' = None):
+        self.db = vector_db_client
+        self.embedding_tool = embedding_tool
+    
+    @property
+    def name(self) -> str:
+        return "vector_search"
+    
+    def input_schema(self) -> dict:
+        return {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query text"},
+                "embedding": {"type": "array", "items": {"type": "number"}},
+                "top_k": {"type": "integer", "default": 5},
+                "collection": {"type": "string"}
+            },
+            "required": ["collection"],
+            "oneOf": [
+                {"required": ["query"]},
+                {"required": ["embedding"]}
+            ]
+        }
+    
+    def execute(
+        self, 
+        collection: str,
+        query: str = None,
+        embedding: list[float] = None,
+        top_k: int = 5
+    ) -> ToolResult:
+        """
+        Search vector DB.
+        Can accept text (will embed) or pre-computed embedding.
+        """
+        try:
+            # Get embedding if text provided
+            if query and not embedding:
+                if not self.embedding_tool:
+                    return ToolResult(
+                        success=False,
+                        data=None,
+                        error="No embedding_tool available for text query"
+                    )
+                embed_result = self.embedding_tool.execute(text=query)
+                if not embed_result.success:
+                    return embed_result
+                embedding = embed_result.data
+            
+            # Search
+            results = self.db.search(
+                collection=collection,
+                query_vector=embedding,
+                limit=top_k
+            )
+            
+            return ToolResult(
+                success=True,
+                data=results,
+                metadata={"collection": collection, "results_count": len(results)}
+            )
+        except Exception as e:
+            return ToolResult(success=False, data=None, error=str(e))
+5. Tool Registry - Local + MCP Bridge
+python
+# tools/registry.py
+
+from typing import Dict, Callable
+from tools.base import BaseTool, ToolResult
+from tools.adapters.local_adapter import LocalToolAdapter
+from tools.adapters.mcp_adapter import MCPToolAdapter
+
+class ToolRegistry:
+    """
+    Central registry for all tools.
+    Handles both local execution and MCP exposure.
+    """
+    
+    def __init__(self, mode: str = "local"):
+        """
+        mode: "local" = run tools directly
+              "mcp" = run tools via MCP protocol (future)
+        """
+        self.mode = mode
+        self._tools: Dict[str, BaseTool] = {}
+        self._adapter = self._create_adapter(mode)
+    
+    def _create_adapter(self, mode: str):
+        """Factory for tool execution adapter"""
+        if mode == "local":
+            return LocalToolAdapter()
+        elif mode == "mcp":
+            return MCPToolAdapter()  # Future implementation
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+    
+    def register(self, tool: BaseTool) -> None:
+        """Register a tool for use"""
+        self._tools[tool.name] = tool
+    
+    def get(self, name: str) -> BaseTool:
+        """Get tool instance (for direct use in nodes)"""
+        return self._tools[name]
+    
+    def execute(self, tool_name: str, **kwargs) -> ToolResult:
+        """
+        Execute tool through adapter.
+        Works same whether local or MCP.
+        """
+        tool = self._tools.get(tool_name)
+        if not tool:
+            return ToolResult(
+                success=False,
+                data=None,
+                error=f"Tool {tool_name} not found"
+            )
+        
+        return self._adapter.execute(tool, **kwargs)
+    
+    def list_tools(self) -> list[str]:
+        """List all registered tools"""
+        return list(self._tools.keys())
+    
+    def get_mcp_definitions(self) -> list[dict]:
+        """
+        Generate MCP tool definitions for all tools.
+        Used by MCP server to expose tools.
+        """
+        return [
+            {
+                "name": tool.name,
+                "description": tool.description,
+                "inputSchema": tool.input_schema()
+            }
+            for tool in self._tools.values()
+        ]
+python
+# tools/adapters/local_adapter.py
+
+from tools.base import BaseTool, ToolResult
+
+class LocalToolAdapter:
+    """Run tools directly (current mode)"""
+    
+    def execute(self, tool: BaseTool, **kwargs) -> ToolResult:
+        """Just call the tool directly"""
+        return tool.execute(**kwargs)
+python
+# tools/adapters/mcp_adapter.py
+
+from tools.base import BaseTool, ToolResult
+
+class MCPToolAdapter:
+    """Run tools via MCP protocol (future)"""
+    
+    def __init__(self, mcp_client=None):
+        self.client = mcp_client
+    
+    def execute(self, tool: BaseTool, **kwargs) -> ToolResult:
+        """
+        Call tool via MCP.
+        Tool signature must match MCP schema.
+        """
+        # Future: Make MCP call
+        # result = await self.client.call_tool(tool.name, **kwargs)
+        # return ToolResult(success=True, data=result)
+        raise NotImplementedError("MCP adapter not yet implemented")
+6. Node Pattern - Using Tools via Registry
+python
+# nodes/resolution/entity_resolver.py
+
+from domain.state import BIAgentState
+from tools.registry import ToolRegistry
+
+def entity_resolver_node(
+    state: BIAgentState,
+    registry: ToolRegistry  # Injected dependency
+) -> dict:
+    """
+    Resolve ambiguous entity names to canonical forms.
+    Uses: llm_tool, embedding_tool, vectordb_tool
+    """
+    
+    intent = state["intent"]
+    unresolved = {}
+    resolved = {}
+    
+    for entity_type, entity_values in intent["entities"].items():
+        for value in entity_values:
+            # Step 1: Embed the entity name
+            embed_result = registry.execute(
+                "embedding",
+                text=value,
+                normalize=True
+            )
+            
+            if not embed_result.success:
+                unresolved[entity_type] = unresolved.get(entity_type, []) + [value]
+                continue
+            
+            # Step 2: Vector search for similar entities
+            search_result = registry.execute(
+                "vector_search",
+                collection=f"{entity_type}_embeddings",
+                embedding=embed_result.data,
+                top_k=3
+            )
+            
+            if not search_result.success or len(search_result.data) == 0:
+                unresolved[entity_type] = unresolved.get(entity_type, []) + [value]
+                continue
+            
+            # Step 3: Use LLM to pick best match (if ambiguous)
+            if len(search_result.data) > 1:
+                llm_result = registry.execute(
+                    "llm",
+                    prompt=f"Pick best match for '{value}': {search_result.data}",
+                    response_format="json"
+                )
+                best_match = llm_result.data["choice"]
+            else:
+                best_match = search_result.data[0]
+            
+            resolved[entity_type] = resolved.get(entity_type, []) + [best_match]
+    
+    return {
+        "resolution": {
+            "unresolved_entities": unresolved,
+            "resolved_entities": resolved,
+            "resolution_metadata": {
+                "total_entities": len(intent["entities"]),
+                "resolved_count": len(resolved)
+            }
+        }
+    }
+7. Memory Management - Across Turns
+python
+# memory/manager.py
+
+from domain.conversation import ConversationTurn, Message
+from domain.memory import ShortTermMemory
+from domain.state import BIAgentState
+from datetime import datetime
+
+class MemoryManager:
+    """
+    Manages memory across conversation turns.
+    Checkpoint = AgentState (within turn)
+    Memory = Conversation history (across turns)
+    """
+    
+    def __init__(self, short_term_memory: ShortTermMemory):
+        self.short_term = short_term_memory
+    
+    def start_turn(self, turn_id: int, user_input: str) -> BIAgentState:
+        """
+        Initialize state for a new turn.
+        Injects short-term memory context.
+        """
+        return {
+            "messages": [],
+            "current_turn_id": turn_id,
+            "user_input": user_input,
+            "memory": self.short_term,  # Reference, not serialized
+            "current_phase": "intent",
+            "iteration_count": 0,
+            "intent": {},
+            "resolution": {},
+            "query": {},
+            "execution": {},
+            "error": None,
+            "agent_response": None
+        }
+    
+    def complete_turn(self, state: BIAgentState) -> ConversationTurn:
+        """
+        Turn finished, create ConversationTurn record.
+        Add to short-term memory.
+        """
+        turn = ConversationTurn(
+            turn_id=state["current_turn_id"],
+            user_message=Message(
+                role="user",
+                content=state["user_input"],
+                timestamp=datetime.now()
+            ),
+            agent_response=Message(
+                role="assistant",
+                content=state["agent_response"],
+                timestamp=datetime.now()
+            ),
+            intent_detected=state["intent"].get("intent_type", "unknown"),
+            entities_extracted=state["resolution"].get("resolved_entities", {}),
+            queries_executed=[state["query"]],
+            started_at=datetime.now(),  # Would track properly
+            completed_at=datetime.now(),
+            tokens_used=0  # Would track properly
+        )
+        
+        self.short_term.add_turn(turn)
+        return turn
+    
+    def get_context_for_prompt(self, n_turns: int = 1) -> str:
+        """
+        Get recent conversation context to inject into prompts.
+        This is how agent "remembers" previous turns.
+        """
+        return self.short_term.get_recent_context(n=n_turns)
+8. Agent Entry Point - Turn Orchestration
+python
+# agent.py
+
+from domain.state import BIAgentState
+from domain.memory import ShortTermMemory
+from memory.manager import MemoryManager
+from memory.checkpointer import create_checkpointer
+from tools.registry import ToolRegistry
+from graph import create_bi_graph
+from config.settings import Settings
+
+class BIAgent:
+    """
+    Main agent interface.
+    Manages conversation turns and memory.
+    """
+    
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        
+        # Setup memory
+        self.short_term_memory = ShortTermMemory(max_turns=3)
+        self.memory_manager = MemoryManager(self.short_term_memory)
+        
+        # Setup tools
+        self.tool_registry = ToolRegistry(mode="local")
+        self._register_tools()
+        
+        # Setup graph
+        checkpointer = create_checkpointer(settings)
+        self.graph = create_bi_graph(
+            tool_registry=self.tool_registry,
+            settings=settings,
+            checkpointer=checkpointer
+        )
+        
+        self.turn_counter = 0
+    
+    def _register_tools(self):
+        """Register all tools with registry"""
+        from tools.embedding.embedding_tool import EmbeddingTool
+        from tools.vector.vectordb_tool import VectorDBTool
+        from tools.llm.llm_tool import LLMTool
+        # ... import other tools
+        
+        # Create and register tools
+        embedding_tool = EmbeddingTool(self.settings)
+        self.tool_registry.register(embedding_tool)
+        
+        vectordb_tool = VectorDBTool(
+            vector_db_client=...,
+            embedding_tool=embedding_tool
+        )
+        self.tool_registry.register(vectordb_tool)
+        
+        # ... register other tools
+    
+    def run_turn(self, user_input: str, thread_id: str = "default") -> str:
+        """
+        Execute one complete conversation turn.
+        
+        Args:
+            user_input: User's message
+            thread_id: Conversation thread identifier
+        
+        Returns:
+            Agent's response
+        """
+        # Increment turn counter
+        self.turn_counter += 1
+        
+        # Initialize state for this turn
+        initial_state = self.memory_manager.start_turn(
+            turn_id=self.turn_counter,
+            user_input=user_input
+        )
+        
+        # Add memory context to initial message
+        context = self.memory_manager.get_context_for_prompt(n_turns=1)
+        if context:
+            initial_state["messages"] = [{
+                "role": "system",
+                "content": f"Previous conversation:\n{context}"
+            }]
+        
+        # Run graph (this is the turn execution)
+        config = {"configurable": {"thread_id": thread_id}}
+        final_state = self.graph.invoke(initial_state, config)
+        
+        # Complete turn and update memory
+        turn = self.memory_manager.complete_turn(final_state)
+        
+        # Return agent's response
+        return final_state["agent_response"]
+    
+    def get_conversation_history(self) -> list[ConversationTurn]:
+        """Get full conversation history"""
+        return self.short_term_memory.turns
+    
+    def clear_memory(self):
+        """Clear conversation memory (start fresh)"""
+        self.short_term_memory.clear()
+        self.turn_counter = 0
+9. Config & Prompts
+python
+# config/settings.py
+
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    """Load from environment"""
+    
+    # LLM
+    llm_provider: str = "openai"
+    llm_model: str = "gpt-4"
+    llm_api_key: str
+    
+    # Embeddings
+    embedding_provider: str = "openai"  # or "local"
+    embedding_model: str = "text-embedding-3-small"
+    
+    # Vector DB
+    vector_db_type: str = "qdrant"
+    vector_db_url: str
+    
+    # Elasticsearch
+    es_url: str
+    es_index: str = "shipments"
+    
+    # Prompts
+    prompts_file: str = "config/prompts.yaml"
+    
+    class Config:
+        env_file = ".env"
+yaml
+# config/prompts.yaml
+
+intent_classification:
+  system: |
+    You are a maritime data assistant. Classify user intent into:
+    - lookup: Find specific records
+    - aggregation: Compute statistics
+    - comparison: Compare entities
+    - trend: Analyze over time
+  
+  user_template: |
+    Previous context: {context}
+    
+    User query: {query}
+    
+    Classify intent and extract entities.
+
+entity_resolution:
+  system: |
+    Resolve ambiguous entity names to canonical forms.
+    
+  user_template: |
+    Entity: "{entity_value}"
+    Type: {entity_type}
+    Similar candidates: {candidates}
+    
+    Pick the best match or state if none match.
+
+# ... more prompts
+Summary
+Conversation Turn = User Input → Agent Processing → Response
+Within a turn: Agent can loop internally (entity resolution, query building)
+Checkpoint: Saved after each turn completes
+Memory: ShortTermMemory tracks last N turns, injected as context
+Tool Architecture
+Local mode (now): Tools run directly via LocalAdapter
+MCP mode (future): Switch adapter, tools run via MCP
+Tools are stateless: No AgentState access, pure input→output
+Registry bridges both: Same interface whether local or MCP
+Memory Hierarchy
+Within turn: AgentState (checkpoint)
+Across turns: ShortTermMemory (last N turns)
+Long-term (future): Persist to DB, retrieve relevant context
+Does this clarify the turn semantics and tool/memory architecture?
+
+then when say agent has a step for clarification and then agent make question right at the node? with checkpoint enabled? and when answered, the agent continue at that exact node?
+
+3:22 PM
+Excellent question! This gets to the heart of LangGraph's execution model with checkpoints. Let me clarify the two patterns:
+
+Pattern 1: Clarification Ends The Turn (Recommended)
+User: "Show me shipments"
+  → classify_intent (needs time range)
+  → route: needs_clarification = True
+  → generate_clarification_response (creates question)
+  → END node
+  → Checkpoint saved ✓
+User sees: "Which time period? Last week, last month, or specify dates?"
+
+[User responds]
+
+User: "Last week"
+  → Load checkpoint ✓
+  → Graph RESTARTS from beginning (entry point)
+  → classify_intent (now has context from memory)
+  → route: needs_clarification = False
+  → build_query
+  → execute
+  → END
+User sees: "Here are 150 shipments from last week..."
+Key point: Agent does NOT resume at the clarification node. It starts fresh with the new input + memory context.
+
+Pattern 2: Internal Loop - Agent Decides Within Turn (Alternative)
+User: "Show me shipments for Anna"
+  → classify_intent
+  → extract_entities (finds "Anna")
+  → resolve_entities_node:
+      - Finds 3 matches: "MSC ANNA", "ANNA MAERSK", "ANNA EXPRESS"
+      - Calls LLM internally: "Pick most likely based on user's history"
+      - LLM chooses "MSC ANNA" (based on memory context)
+      - Continues to next node
+  → build_query (uses "MSC ANNA")
+  → execute
+  → END
+User sees: "Here are 5 shipments for MSC ANNA..."
+Key point: Agent resolves ambiguity internally WITHOUT asking user. This stays within one turn.
+
+Your Question: Can Agent Pause Mid-Execution?
+Short Answer: No, not the way you're thinking.
+LangGraph's checkpoint model:
+
+Checkpoints save state between invocations (between turns)
+You cannot checkpoint mid-execution and have user respond in same flow
+Graph either completes (reaches END) or raises interrupt
+The Right Pattern: Human-in-the-Loop with Interrupts
+If you want agent to pause and wait for user decision mid-flow:
+
+python
+# nodes/resolution/entity_resolver.py
+
+def entity_resolver_node(state: BIAgentState) -> dict:
+    """Resolve entities or request clarification"""
+    
+    # Try automatic resolution
+    candidates = vector_search(entity_value)
+    
+    if len(candidates) == 1:
+        # Unambiguous - continue
+        return {"resolution": {"resolved": candidates[0]}}
+    
+    elif len(candidates) > 1:
+        # Ambiguous - need human decision
+        # Store candidates in state for user to pick
+        return {
+            "resolution": {
+                "ambiguous_entities": {
+                    "vessel": candidates
+                },
+                "awaiting_user_choice": True
+            },
+            "current_phase": "clarification"
+        }
+    
+    # Graph routing will detect awaiting_user_choice and end turn
+python
+# routing/clarification_router.py
+
+def route_after_resolution(state: BIAgentState) -> str:
+    """Route based on resolution results"""
+    
+    resolution = state["resolution"]
+    
+    if resolution.get("awaiting_user_choice"):
+        # Agent needs to ask user - end turn here
+        return "generate_clarification_question"
+    
+    elif resolution.get("resolved"):
+        # Continue to query building
+        return "build_query"
+    
+    else:
+        # Resolution failed
+        return "handle_error"
+python
+# Graph structure
+
+graph.add_conditional_edges(
+    "resolve_entities",
+    route_after_resolution,
+    {
+        "generate_clarification_question": "generate_clarification_question",
+        "build_query": "build_query",
+        "handle_error": "handle_error"
+    }
+)
+
+graph.add_edge("generate_clarification_question", END)  # Turn ends here
+```
+
+### What Happens:
+```
+Turn 1:
+User: "Show me shipments for Anna"
+  → resolve_entities (finds 3 matches)
+  → route: awaiting_user_choice = True
+  → generate_clarification_question
+  → END
+  → Checkpoint saved: {
+      "resolution": {
+        "ambiguous_entities": {
+          "vessel": [
+            {"name": "MSC ANNA", "imo": "123"},
+            {"name": "ANNA MAERSK", "imo": "456"},
+            {"name": "ANNA EXPRESS", "imo": "789"}
+          ]
+        },
+        "awaiting_user_choice": True
+      },
+      "current_turn_id": 1,
+      ...
+    }
+
+User sees: "I found 3 vessels named Anna:
+           1. MSC ANNA (IMO: 123)
+           2. ANNA MAERSK (IMO: 456)
+           3. ANNA EXPRESS (IMO: 789)
+           Which one?"
+
+---
+
+Turn 2:
+User: "The first one" (or "MSC ANNA")
+  → Graph loads checkpoint from Turn 1 ✓
+  → Graph RESTARTS from entry point
+  → classify_intent (sees "The first one" + previous context)
+  → extract_entities (understands reference to previous choices)
+  → resolve_entities:
+      - Sees state.resolution.ambiguous_entities from Turn 1
+      - Matches user choice to "MSC ANNA"
+      - Returns resolved entity
+  → route: awaiting_user_choice = False
+  → build_query
+  → execute
+  → END
+
+User sees: "Here are 5 shipments for MSC ANNA..."
+```
+
+## Critical Understanding: Checkpoints Don't "Resume"
+
+**Common Misconception:**
+```
+❌ Graph pauses at node X
+❌ Checkpoint saves "current position = node X"
+❌ Next turn resumes execution from node X
+```
+
+**Actual Behavior:**
+```
+✓ Graph runs to END (or interrupt)
+✓ Checkpoint saves entire state
+✓ Next turn starts from entry point
+✓ State from previous turn is available
+✓ Nodes make decisions based on state
+Design Recommendation: Make Clarification Explicit
+python
+# domain/state.py
+
+class ClarificationContext(TypedDict):
+    """Tracks clarification state"""
+    is_needed: bool
+    clarification_type: Literal["entity_choice", "time_range", "filter", None]
+    question: str
+    options: list[dict]  # For multiple choice
+    referring_to_turn: int  # Which turn needs clarification
+
+class BIAgentState(TypedDict):
+    # ... other fields
+    clarification: ClarificationContext
+python
+# nodes/response/clarification_generator.py
+
+def generate_clarification_question(state: BIAgentState) -> dict:
+    """
+    Generate clarification question based on what's needed.
+    This node ENDS the turn.
+    """
+    
+    clarification = state["clarification"]
+    
+    if clarification["clarification_type"] == "entity_choice":
+        options = clarification["options"]
+        question = f"I found {len(options)} matches:\n"
+        for i, opt in enumerate(options, 1):
+            question += f"{i}. {opt['name']} (IMO: {opt['imo']})\n"
+        question += "Which one do you mean?"
+        
+    elif clarification["clarification_type"] == "time_range":
+        question = "Which time period? (last week, last month, or specify dates)"
+    
+    return {
+        "agent_response": question,
+        "current_phase": "awaiting_clarification"
+    }
+python
+# nodes/intent/classifier.py (next turn)
+
+def classify_intent(state: BIAgentState, registry: ToolRegistry) -> dict:
+    """
+    Classify intent - aware of clarification context.
+    """
+    
+    user_input = state["user_input"]
+    
+    # Check if this is a clarification response
+    if state.get("clarification", {}).get("is_needed"):
+        prev_clarification = state["clarification"]
+        
+        # This is a response to clarification
+        # Parse the response in context
+        prompt = f"""
+        Previous question: {prev_clarification['question']}
+        Available options: {prev_clarification['options']}
+        User response: {user_input}
+        
+        Parse which option the user chose.
+        """
+        
+        result = registry.execute("llm", prompt=prompt, response_format="json")
+        
+        return {
+            "intent": {
+                "intent_type": "clarification_response",
+                "resolved_choice": result.data,
+                "original_intent": prev_clarification.get("original_intent")
+            },
+            "clarification": {
+                "is_needed": False,  # Clear clarification flag
+                "clarification_type": None
+            }
+        }
+    
+    else:
+        # Normal intent classification
+        # ... classify as usual
+        pass
+Alternative: Interrupt-Based Pattern (Advanced)
+LangGraph does support interrupts for human-in-the-loop:
+
+python
+from langgraph.checkpoint.memory import MemorySaver
+
+def entity_resolver_node(state: BIAgentState):
+    candidates = vector_search(entity_value)
+    
+    if len(candidates) > 1:
+        # Raise interrupt - graph will pause here
+        raise NodeInterrupt(
+            message="Multiple vessels found",
+            data={"candidates": candidates}
+        )
+    
+    return {"resolution": {"resolved": candidates[0]}}
+
+# Compile with interrupt
+graph = graph.compile(
+    checkpointer=MemorySaver(),
+    interrupt_before=["entity_resolver"]  # or interrupt_after
+)
+
+# Usage
+try:
+    result = graph.invoke(initial_state, config)
+except NodeInterrupt as e:
+    # Show options to user
+    print(e.message)
+    print(e.data["candidates"])
+    
+    # User responds
+    user_choice = get_user_input()
+    
+    # Resume with user's choice
+    state_update = {"resolution": {"resolved": user_choice}}
+    result = graph.invoke(state_update, config)  # Continues from interrupt point!
+But: This interrupt pattern is complex and typically used for:
+
+Code generation agents (interrupt before executing code)
+Tool calling agents (interrupt before dangerous operations)
+Not typically recommended for conversational clarifications
+Recommendation
+Use Pattern 1: Clarification Ends Turn
+
+It's simpler, cleaner, and works naturally with chat interfaces:
+
+Agent detects need for clarification → generates question → END turn
+Save state with clarification context
+User responds → new turn starts
+Agent sees clarification context in state → understands response → continues
+This matches how humans converse and how chat UIs work!
+
+Does this clarify when/how checkpoints work with clarifications?
+
+okay, create me a detailed design document, and i want start a skeleton project with this readme.md
+
+3:27 PM
+Business Intelligence Agent - Design Document
+Executive Summary
+A sophisticated LangGraph-based conversational agent for querying and analyzing maritime/import-export data. The agent uses natural language understanding, entity resolution, and intelligent query building to interact with Elasticsearch and GraphQL data sources.
+
+Core Capabilities
+Natural language to structured query translation
+Entity name resolution using vector similarity
+Multi-phase conversation management with clarification support
+Stateless tool architecture ready for MCP exposure
+Short-term memory for conversation continuity
+1. Architecture Overview
+1.1 High-Level Architecture
+┌─────────────────────────────────────────────────────────────┐
+│                        User Interface                        │
+│                     (CLI / API / Chat)                       │
+└───────────────────────────┬─────────────────────────────────┘
+                            │
+                    ┌───────▼────────┐
+                    │   BIAgent      │
+                    │  (agent.py)    │
+                    │                │
+                    │ - run_turn()   │
+                    │ - Memory Mgmt  │
+                    └───────┬────────┘
+                            │
+        ┌───────────────────┼───────────────────┐
+        │                   │                   │
+┌───────▼────────┐  ┌──────▼──────┐  ┌────────▼────────┐
+│ Memory Manager │  │  LangGraph  │  │ Tool Registry   │
+│                │  │   Graph     │  │                 │
+│ - Short-term   │  │  (graph.py) │  │ - Local exec    │
+│ - Turn history │  │             │  │ - MCP ready     │
+└────────────────┘  └──────┬──────┘  └────────┬────────┘
+                            │                   │
+                    ┌───────▼────────┐         │
+                    │     Nodes      │         │
+                    │                │         │
+                    │ Intent         │         │
+                    │ Resolution     │◄────────┤
+                    │ Query          │         │
+                    │ Execution      │         │
+                    │ Response       │         │
+                    └───────┬────────┘         │
+                            │                  │
+                            └──────────────────┘
+                                    │
+                    ┌───────────────▼────────────────┐
+                    │           Tools                │
+                    │                                │
+                    │  LLM | Embedding | VectorDB   │
+                    │  ES Executor | GraphQL        │
+                    └────────────────────────────────┘
+1.2 Key Architectural Principles
+Separation of Concerns
+Nodes: Stateful orchestration logic
+Tools: Stateless execution units
+Memory: Conversation state management
+State: Data flow container
+Conversation Turn Model
+One turn = User input → Agent processing → Response
+Checkpoints saved after each turn
+Agent can loop internally within a turn
+Clarifications end the current turn
+Tool Design Philosophy
+Tools are pure functions (input → output)
+No direct state access
+Can be called from nodes, MCP, or API
+Registry abstracts execution mode (local vs MCP)
+2. Directory Structure
+bi_agent/
+├── README.md                        # Project documentation
+├── pyproject.toml                   # Poetry dependencies
+├── .env.example                     # Environment template
+├── .gitignore
+│
+├── config/
+│   ├── __init__.py
+│   ├── settings.py                  # Settings loader (Pydantic)
+│   ├── prompts.yaml                 # All LLM prompts
+│   └── tool_config.yaml             # Tool configurations
+│
+├── domain/                          # Domain models & state
+│   ├── __init__.py
+│   ├── state.py                     # BIAgentState definition
+│   ├── conversation.py              # Message, ConversationTurn
+│   ├── memory.py                    # Memory interfaces
+│   ├── query.py                     # Query domain objects
+│   └── entities.py                  # Entity domain objects
+│
+├── tools/                           # Stateless tools
+│   ├── __init__.py
+│   ├── registry.py                  # Tool registry + adapter factory
+│   ├── base.py                      # BaseTool, ToolResult
+│   │
+│   ├── llm/
+│   │   ├── __init__.py
+│   │   └── llm_tool.py              # LLM completions
+│   │
+│   ├── embedding/
+│   │   ├── __init__.py
+│   │   └── embedding_tool.py        # Text embeddings
+│   │
+│   ├── vector/
+│   │   ├── __init__.py
+│   │   └── vectordb_tool.py         # Vector similarity search
+│   │
+│   ├── data_sources/
+│   │   ├── __init__.py
+│   │   ├── es_executor.py           # Elasticsearch execution
+│   │   └── graphql_executor.py      # GraphQL execution
+│   │
+│   ├── query_builders/
+│   │   ├── __init__.py
+│   │   ├── es_builder.py            # ES query construction
+│   │   └── graphql_builder.py       # GraphQL query construction
+│   │
+│   └── adapters/
+│       ├── __init__.py
+│       ├── local_adapter.py         # Direct tool execution
+│       └── mcp_adapter.py           # MCP protocol execution (future)
+│
+├── nodes/                           # Orchestration nodes
+│   ├── __init__.py
+│   │
+│   ├── intent/
+│   │   ├── __init__.py
+│   │   ├── classifier.py            # Intent classification
+│   │   └── entity_extractor.py      # Entity extraction
+│   │
+│   ├── resolution/
+│   │   ├── __init__.py
+│   │   └── entity_resolver.py       # Entity name resolution
+│   │
+│   ├── query/
+│   │   ├── __init__.py
+│   │   ├── query_planner.py         # Query strategy planning
+│   │   ├── query_builder.py         # Query construction orchestration
+│   │   └── validator.py             # Query validation
+│   │
+│   ├── execution/
+│   │   ├── __init__.py
+│   │   ├── executor_node.py         # Query execution orchestration
+│   │   └── result_merger.py         # Multi-source result merging
+│   │
+│   └── response/
+│       ├── __init__.py
+│       ├── formatter.py             # Result formatting
+│       ├── generator.py             # Natural language generation
+│       └── clarification.py         # Clarification question generation
+│
+├── routing/
+│   ├── __init__.py
+│   ├── intent_router.py             # Route after intent analysis
+│   ├── execution_router.py          # Route after query execution
+│   └── clarification_router.py      # Clarification decision logic
+│
+├── memory/
+│   ├── __init__.py
+│   ├── manager.py                   # MemoryManager
+│   ├── short_term.py                # ShortTermMemory implementation
+│   └── checkpointer.py              # LangGraph checkpointer setup
+│
+├── mcp_server/                      # MCP exposure (future)
+│   ├── __init__.py
+│   ├── server.py                    # MCP server setup
+│   └── tool_registry.py             # MCP tool definitions generator
+│
+├── graph.py                         # Graph assembly
+├── agent.py                         # Agent entry point
+│
+├── cli.py                           # CLI interface (optional)
+├── api.py                           # FastAPI endpoints (optional)
+│
+└── tests/
+    ├── __init__.py
+    ├── test_tools/
+    ├── test_nodes/
+    ├── test_routing/
+    └── test_integration/
+3. Core Components Design
+3.1 Domain Objects
+3.1.1 State Schema
+python
+# domain/state.py
+
+class IntentContext(TypedDict):
+    """User intent understanding"""
+    intent_type: Literal["lookup", "aggregation", "comparison", "trend"]
+    confidence: float
+    entities: dict[str, list[str]]
+    time_range: dict | None
+    filters: list[dict]
+    requires_clarification: list[str]
+
+class ResolutionContext(TypedDict):
+    """Entity resolution state"""
+    unresolved_entities: dict[str, list[str]]
+    resolved_entities: dict[str, list[dict]]
+    ambiguous_entities: dict[str, list[dict]]
+    resolution_metadata: dict
+
+class QueryContext(TypedDict):
+    """Query building state"""
+    query_type: Literal["elasticsearch", "graphql", "hybrid"]
+    es_query: dict | None
+    graphql_query: str | None
+    query_plan: dict
+    validation_errors: list[str]
+    optimization_applied: bool
+
+class ExecutionContext(TypedDict):
+    """Query execution results"""
+    raw_results: dict
+    record_count: int
+    execution_time_ms: float
+    data_sources_used: list[str]
+    cache_hit: bool
+
+class ClarificationContext(TypedDict):
+    """Clarification state"""
+    is_needed: bool
+    clarification_type: Literal["entity_choice", "time_range", "filter", None]
+    question: str
+    options: list[dict]
+    referring_to_turn: int
+
+class BIAgentState(TypedDict):
+    """Root agent state - one turn"""
+    # LangGraph messages
+    messages: Annotated[list, add_messages]
+    
+    # Current turn
+    current_turn_id: int
+    user_input: str
+    
+    # Phase contexts
+    intent: IntentContext
+    resolution: ResolutionContext
+    query: QueryContext
+    execution: ExecutionContext
+    clarification: ClarificationContext
+    
+    # Memory reference (not serialized)
+    memory: ShortTermMemory | None
+    
+    # Workflow
+    current_phase: str
+    iteration_count: int
+    error: str | None
+    agent_response: str | None
+3.1.2 Conversation & Memory
+python
+# domain/conversation.py
+
+class Message(BaseModel):
+    """Single message"""
+    role: Literal["user", "assistant", "system"]
+    content: str
+    timestamp: datetime
+    metadata: dict = {}
+
+class ConversationTurn(BaseModel):
+    """One complete turn"""
+    turn_id: int
+    user_message: Message
+    agent_response: Message
+    intent_detected: str
+    entities_extracted: dict
+    queries_executed: list[dict]
+    started_at: datetime
+    completed_at: datetime
+    tokens_used: int
+python
+# domain/memory.py
+
+class ShortTermMemory:
+    """Last N turns memory"""
+    def __init__(self, max_turns: int = 3):
+        self.max_turns = max_turns
+        self.turns: list[ConversationTurn] = []
+    
+    def add_turn(self, turn: ConversationTurn) -> None:
+        """Add turn, evict if needed"""
+        
+    def get_recent_context(self, n: int = 1) -> str:
+        """Format last N turns for prompt"""
+        
+    def get_last_turn(self) -> ConversationTurn | None:
+        """Get most recent turn"""
+3.2 Tool Architecture
+3.2.1 Base Tool Interface
+python
+# tools/base.py
+
+class ToolResult(BaseModel):
+    """Standardized tool output"""
+    success: bool
+    data: Any
+    error: str | None = None
+    metadata: dict = {}
+
+class BaseTool(ABC):
+    """Base interface for all tools"""
+    
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Tool name"""
+        
+    @property
+    @abstractmethod
+    def description(self) -> str:
+        """Tool description"""
+        
+    @abstractmethod
+    def input_schema(self) -> dict:
+        """JSON schema (MCP compatible)"""
+        
+    @abstractmethod
+    def execute(self, **kwargs) -> ToolResult:
+        """Execute tool"""
+3.2.2 Tool Registry
+python
+# tools/registry.py
+
+class ToolRegistry:
+    """Central tool registry"""
+    
+    def __init__(self, mode: str = "local"):
+        """mode: "local" or "mcp" """
+        self.mode = mode
+        self._tools: Dict[str, BaseTool] = {}
+        self._adapter = self._create_adapter(mode)
+    
+    def register(self, tool: BaseTool) -> None:
+        """Register tool"""
+        
+    def get(self, name: str) -> BaseTool:
+        """Get tool instance"""
+        
+    def execute(self, tool_name: str, **kwargs) -> ToolResult:
+        """Execute through adapter"""
+        
+    def get_mcp_definitions(self) -> list[dict]:
+        """Generate MCP schemas"""
+3.2.3 Key Tools
+LLM Tool
+
+python
+# tools/llm/llm_tool.py
+
+class LLMTool(BaseTool):
+    """LLM completions"""
+    
+    def execute(
+        self,
+        prompt: str,
+        system_prompt: str = None,
+        response_format: Literal["text", "json"] = "text",
+        temperature: float = 0.7,
+        max_tokens: int = 1000
+    ) -> ToolResult:
+        """Generate completion"""
+Embedding Tool
+
+python
+# tools/embedding/embedding_tool.py
+
+class EmbeddingTool(BaseTool):
+    """Text embeddings"""
+    
+    def execute(
+        self,
+        text: str,
+        normalize: bool = True
+    ) -> ToolResult:
+        """Generate embedding vector"""
+VectorDB Tool
+
+python
+# tools/vector/vectordb_tool.py
+
+class VectorDBTool(BaseTool):
+    """Vector similarity search"""
+    
+    def execute(
+        self,
+        collection: str,
+        query: str = None,
+        embedding: list[float] = None,
+        top_k: int = 5
+    ) -> ToolResult:
+        """Search vectors"""
+ES Executor Tool
+
+python
+# tools/data_sources/es_executor.py
+
+class ESExecutorTool(BaseTool):
+    """Execute ES queries"""
+    
+    def execute(
+        self,
+        query: dict,
+        index: str,
+        timeout_ms: int = 30000,
+        max_results: int = 1000
+    ) -> ToolResult:
+        """Execute and return results"""
+3.3 Node Patterns
+All nodes follow this pattern:
+
+python
+def node_function(
+    state: BIAgentState,
+    registry: ToolRegistry  # Injected dependency
+) -> dict:
+    """
+    Node documentation
+    
+    Inputs (from state):
+        - state.field1
+        - state.field2
+    
+    Outputs (returns):
+        - field3: updated value
+        - field4: new value
+    
+    Tools used:
+        - tool_name_1
+        - tool_name_2
+    """
+    
+    # Read from state
+    input_data = state["some_field"]
+    
+    # Call tools via registry
+    result = registry.execute("tool_name", param=value)
+    
+    if not result.success:
+        return {"error": result.error}
+    
+    # Return state updates (LangGraph merges)
+    return {
+        "some_context": {
+            "field1": result.data,
+            "field2": computed_value
+        }
+    }
+```
+
+### 3.4 Graph Flow
+```
+Entry Point
+    ↓
+classify_intent ──→ extract_entities
+                           ↓
+                    route_after_intent
+                    ↙        ↓        ↘
+        clarification   resolve_entities   handle_error
+              ↓              ↓
+             END      route_after_resolution
+                      ↙              ↘
+            build_query          clarification → END
+                ↓
+          validate_query
+                ↓
+         route_after_validation
+         ↙              ↘
+   optimize_query    execute_query
+         ↓                 ↓
+   execute_query    merge_results (if hybrid)
+         ↓                 ↓
+    format_response ←──────┘
+         ↓
+    generate_response
+         ↓
+        END
+```
+
+---
+
+## 4. Conversation Turn Semantics
+
+### 4.1 Turn Definition
+
+**One Turn = User Input → Agent Processing (internal loops allowed) → Response**
+
+### 4.2 Turn Flow Examples
+
+**Example 1: Simple Query (1 turn)**
+```
+User: "Show me shipments for MSC ANNA from last week"
+Agent: classify → extract → resolve → build → execute → respond
+User sees: "Here are 5 shipments..."
+```
+
+**Example 2: Clarification Needed (2 turns)**
+```
+Turn 1:
+User: "Show me shipments"
+Agent: classify → needs time range → generate clarification → END
+User sees: "Which time period?"
+
+Turn 2:
+User: "Last week"
+Agent: classify → extract → resolve → build → execute → respond
+User sees: "Here are 150 shipments from last week..."
+```
+
+**Example 3: Internal Resolution (1 turn)**
+```
+User: "Show me shipments for Anna"
+Agent: classify → extract "Anna" → resolve (finds 3 matches) → 
+       LLM picks based on history → build → execute → respond
+User sees: "Here are 5 shipments for MSC ANNA..."
+```
+
+### 4.3 Checkpoint Behavior
+
+- **Saved**: After each turn completes (at END node)
+- **Contains**: Full BIAgentState for that turn
+- **Next turn**: Graph restarts from entry point with:
+  - New user input
+  - Previous state available
+  - Memory context injected
+
+**Important**: Checkpoints do NOT resume execution mid-flow. Graph always starts from entry point.
+
+---
+
+## 5. Memory Management
+
+### 5.1 Memory Hierarchy
+```
+┌─────────────────────────────────────────┐
+│         Within Turn (Checkpoint)         │
+│                                          │
+│  BIAgentState:                           │
+│  - messages: [...]                       │
+│  - intent: {...}                         │
+│  - resolution: {...}                     │
+│  - query: {...}                          │
+│  - execution: {...}                      │
+│                                          │
+│  Saved after turn ends                   │
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│      Across Turns (ShortTermMemory)      │
+│                                          │
+│  Last N ConversationTurns:               │
+│  - Turn 1: User + Agent messages         │
+│  - Turn 2: User + Agent messages         │
+│  - Turn 3: User + Agent messages         │
+│                                          │
+│  Injected as context in prompts          │
+└─────────────────────────────────────────┘
+
+┌─────────────────────────────────────────┐
+│      Long-term (Future)                  │
+│                                          │
+│  - Persisted to database                 │
+│  - Retrieved for relevant context        │
+│  - User preferences                      │
+└─────────────────────────────────────────┘
+5.2 Memory Manager
+python
+# memory/manager.py
+
+class MemoryManager:
+    """Manages memory across turns"""
+    
+    def start_turn(self, turn_id: int, user_input: str) -> BIAgentState:
+        """Initialize state for new turn"""
+        # Create fresh state
+        # Inject memory reference
+        
+    def complete_turn(self, state: BIAgentState) -> ConversationTurn:
+        """Turn finished, save to memory"""
+        # Create ConversationTurn
+        # Add to short-term memory
+        
+    def get_context_for_prompt(self, n_turns: int = 1) -> str:
+        """Get recent context for LLM"""
+        # Format last N turns
+6. Configuration Management
+6.1 Settings
+python
+# config/settings.py
+
+class Settings(BaseSettings):
+    """Environment-based configuration"""
+    
+    # LLM
+    llm_provider: str = "openai"
+    llm_model: str = "gpt-4"
+    llm_api_key: str
+    llm_temperature: float = 0.7
+    
+    # Embeddings
+    embedding_provider: str = "openai"
+    embedding_model: str = "text-embedding-3-small"
+    
+    # Vector DB
+    vector_db_type: str = "qdrant"
+    vector_db_url: str
+    vector_db_collection_prefix: str = "bi_agent"
+    
+    # Elasticsearch
+    es_url: str
+    es_index: str = "shipments"
+    es_timeout_ms: int = 30000
+    
+    # GraphQL
+    graphql_url: str
+    graphql_timeout_ms: int = 30000
+    
+    # Memory
+    short_term_memory_turns: int = 3
+    
+    # Prompts
+    prompts_file: str = "config/prompts.yaml"
+    
+    class Config:
+        env_file = ".env"
+6.2 Prompts
+yaml
+# config/prompts.yaml
+
+intent_classification:
+  system: |
+    You are a maritime data assistant specializing in import/export shipment data.
+    
+    Classify user intent into one of:
+    - lookup: Find specific records (e.g., "Show me shipments for MSC ANNA")
+    - aggregation: Compute statistics (e.g., "How many shipments last month?")
+    - comparison: Compare entities (e.g., "Compare MSC vs Maersk shipments")
+    - trend: Analyze over time (e.g., "Show shipment trends for Q4")
+    
+    Extract entities:
+    - vessel: Vessel names
+    - port: Port names
+    - time_range: Time periods
+    - cargo: Cargo types
+    
+  user_template: |
+    {context}
+    
+    User query: {query}
+    
+    Respond with JSON:
+    {
+      "intent_type": "lookup|aggregation|comparison|trend",
+      "confidence": 0.0-1.0,
+      "entities": {
+        "vessel": ["name1", "name2"],
+        "port": ["port1"],
+        ...
+      },
+      "requires_clarification": ["field_name"] or []
+    }
+
+entity_resolution:
+  system: |
+    Resolve ambiguous entity names to canonical forms using vector search results.
+    
+  user_template: |
+    Entity value: "{entity_value}"
+    Entity type: {entity_type}
+    
+    Similar candidates from database:
+    {candidates}
+    
+    User context from previous turns:
+    {context}
+    
+    Respond with JSON:
+    {
+      "best_match": {candidate object} or null,
+      "confidence": 0.0-1.0,
+      "reasoning": "why this match"
+    }
+
+clarification_entity_choice:
+  user_template: |
+    I found multiple {entity_type} matching "{entity_value}":
+    
+    {options}
+    
+    Which one do you mean? (respond with number or name)
+
+clarification_time_range:
+  user_template: |
+    Which time period are you interested in?
+    - Last week
+    - Last month
+    - Last quarter
+    - Specify custom dates
+
+query_validation:
+  system: |
+    Validate Elasticsearch query structure for correctness.
+    
+  user_template: |
+    Query: {query}
+    Index mapping: {mapping}
+    
+    Check for:
+    - Field existence
+    - Type compatibility
+    - Syntax errors
+    
+    Respond with JSON:
+    {
+      "valid": true/false,
+      "errors": ["error1", "error2"],
+      "suggestions": ["fix1", "fix2"]
+    }
+
+response_generation:
+  system: |
+    Generate natural language response from query results.
+    Be concise, helpful, and highlight key insights.
+    
+  user_template: |
+    User query: {original_query}
+    Query results: {results}
+    Record count: {count}
+    
+    Generate a helpful response summarizing the data.
+7. Agent Initialization & Execution
+7.1 Agent Entry Point
+python
+# agent.py
+
+class BIAgent:
+    """Main agent interface"""
+    
+    def __init__(self, settings: Settings):
+        # Setup components
+        self.settings = settings
+        self.short_term_memory = ShortTermMemory(max_turns=settings.short_term_memory_turns)
+        self.memory_manager = MemoryManager(self.short_term_memory)
+        self.tool_registry = ToolRegistry(mode="local")
+        self._register_tools()
+        
+        # Compile graph
+        checkpointer = create_checkpointer(settings)
+        self.graph = create_bi_graph(
+            tool_registry=self.tool_registry,
+            settings=settings,
+            checkpointer=checkpointer
+        )
+        
+        self.turn_counter = 0
+    
+    def run_turn(self, user_input: str, thread_id: str = "default") -> str:
+        """Execute one conversation turn"""
+        # Increment turn
+        self.turn_counter += 1
+        
+        # Initialize state
+        initial_state = self.memory_manager.start_turn(
+            turn_id=self.turn_counter,
+            user_input=user_input
+        )
+        
+        # Inject memory context
+        context = self.memory_manager.get_context_for_prompt(n_turns=1)
+        if context:
+            initial_state["messages"] = [{
+                "role": "system",
+                "content": f"Previous conversation:\n{context}"
+            }]
+        
+        # Run graph
+        config = {"configurable": {"thread_id": thread_id}}
+        final_state = self.graph.invoke(initial_state, config)
+        
+        # Complete turn
+        turn = self.memory_manager.complete_turn(final_state)
+        
+        return final_state["agent_response"]
+7.2 Graph Assembly
+python
+# graph.py
+
+def create_bi_graph(
+    tool_registry: ToolRegistry,
+    settings: Settings,
+    checkpointer
+) -> CompiledGraph:
+    """Assemble the Lang
+now what are these context for? i want a node to decide if continuation of conversation and i also want a reiterate_intention. For ES query i have two path, one for generate search query one for generate aggregation query and the decision to invoke es query builder is for JOIN/GROUP ed business object. Single business object is routed to graphql
+
+3:33 PM
+Excellent questions! Let me clarify and refine the design with your specific requirements.
+
+Context Usage Clarification
+The contexts in BIAgentState serve different purposes:
+
+Why Multiple Contexts?
+python
+class BIAgentState(TypedDict):
+    # These are PHASE-SPECIFIC data containers
+    
+    intent: IntentContext          # What user wants (Phase 1 output)
+    resolution: ResolutionContext  # Resolved entities (Phase 2 output)
+    query: QueryContext           # Query being built (Phase 3 output)
+    execution: ExecutionContext   # Query results (Phase 4 output)
+```
+
+**Purpose**: Clean separation of concerns - each node reads from previous phase context and writes to its own phase context.
+
+**Example flow**:
+```
+classify_intent → writes to state["intent"]
+resolve_entities → reads state["intent"], writes to state["resolution"]
+build_query → reads state["resolution"], writes to state["query"]
+execute_query → reads state["query"], writes to state["execution"]
+Refined Design with Your Requirements
+Let me update the architecture to include:
+
+Conversation continuation detection
+Intent reiteration/refinement
+ES vs GraphQL routing (JOIN/GROUP → ES, single object → GraphQL)
+ES dual path (search vs aggregation)
+Updated State Schema
+python
+# domain/state.py
+
+class ConversationContext(TypedDict):
+    """Track conversation flow state"""
+    is_continuation: bool           # Is this continuing previous query?
+    previous_intent: str | None     # Intent from last turn
+    needs_reiteration: bool         # Should agent reiterate understanding?
+    continuation_type: Literal["refinement", "follow_up", "new_topic", None]
+
+class IntentContext(TypedDict):
+    """Enhanced intent with business object analysis"""
+    intent_type: Literal["lookup", "aggregation", "comparison", "trend"]
+    confidence: float
+    entities: dict[str, list[str]]
+    time_range: dict | None
+    filters: list[dict]
+    
+    # NEW: Business object analysis
+    business_objects: list[str]     # ["shipment", "vessel", "container"]
+    requires_join: bool             # Multiple objects need joining
+    requires_grouping: bool         # Aggregation requires GROUP BY
+    aggregation_type: str | None    # "count", "sum", "avg", "group_by"
+    
+    requires_clarification: list[str]
+
+class QueryContext(TypedDict):
+    """Enhanced query context with routing info"""
+    # Routing decision
+    query_type: Literal["elasticsearch", "graphql", "hybrid"]
+    routing_reason: str             # Why this route was chosen
+    
+    # ES specific
+    es_query_variant: Literal["search", "aggregation", None]
+    es_query: dict | None
+    
+    # GraphQL specific
+    graphql_query: str | None
+    graphql_variables: dict | None
+    
+    # Execution plan
+    query_plan: dict
+    validation_errors: list[str]
+
+class BIAgentState(TypedDict):
+    """Root state with conversation tracking"""
+    messages: Annotated[list, add_messages]
+    
+    # Turn info
+    current_turn_id: int
+    user_input: str
+    
+    # NEW: Conversation flow
+    conversation: ConversationContext
+    
+    # Phase contexts
+    intent: IntentContext
+    resolution: ResolutionContext
+    query: QueryContext
+    execution: ExecutionContext
+    clarification: ClarificationContext
+    
+    # Memory & workflow
+    memory: ShortTermMemory | None
+    current_phase: str
+    iteration_count: int
+    error: str | None
+    agent_response: str | None
+```
+
+---
+
+## Updated Graph Flow
+```
+Entry Point
+    ↓
+detect_conversation_type ──→ Is continuation?
+    ↓                            ↙         ↘
+    NO (new topic)          YES          UNCLEAR
+    ↓                        ↓               ↓
+classify_intent     reiterate_intent    ask_continuation_clarification → END
+    ↓                        ↓
+    └────────────────────────┘
+              ↓
+      extract_entities
+              ↓
+      resolve_entities
+              ↓
+      route_after_resolution
+      ↙              ↘
+clarification    analyze_business_objects
+    ↓                    ↓
+   END            route_query_strategy
+              ↙         ↓         ↘
+      single_object  join/group  hybrid
+           ↓            ↓           ↓
+    build_graphql  route_es_type  build_both
+                   ↙         ↘
+            search_query  agg_query
+                   ↓         ↓
+            build_es_search build_es_agg
+                   ↓         ↓
+                   └─────┬───┘
+                         ↓
+                  validate_query
+                         ↓
+                  execute_query
+                         ↓
+                  format_response
+                         ↓
+                  generate_response
+                         ↓
+                        END
+Key New Nodes
+1. Conversation Continuation Detection
+python
+# nodes/intent/conversation_detector.py
+
+from domain.state import BIAgentState
+from tools.registry import ToolRegistry
+
+def detect_conversation_type(
+    state: BIAgentState,
+    registry: ToolRegistry
+) -> dict:
+    """
+    Detect if user input is continuing previous conversation.
+    
+    Inputs:
+        - state.user_input
+        - state.memory (last turn)
+    
+    Outputs:
+        - conversation.is_continuation
+        - conversation.continuation_type
+        - conversation.needs_reiteration
+    
+    Tools:
+        - llm_tool
+    """
+    
+    user_input = state["user_input"]
+    memory = state["memory"]
+    
+    # Get last turn context
+    last_turn = memory.get_last_turn() if memory else None
+    
+    if not last_turn:
+        # First turn, definitely not continuation
+        return {
+            "conversation": {
+                "is_continuation": False,
+                "previous_intent": None,
+                "needs_reiteration": False,
+                "continuation_type": None
+            }
+        }
+    
+    # Use LLM to detect continuation
+    prompt = f"""
+Previous user query: {last_turn.user_message.content}
+Previous intent: {last_turn.intent_detected}
+Previous entities: {last_turn.entities_extracted}
+
+Current user input: {user_input}
+
+Is the current input:
+1. "refinement" - refining/modifying the previous query (e.g., "actually make that last month" after "show shipments last week")
+2. "follow_up" - asking for more info about previous results (e.g., "show me more details" or "what about containers?")
+3. "new_topic" - completely new query
+4. "unclear" - ambiguous, need to ask user
+
+Respond with JSON:
+{{
+  "continuation_type": "refinement|follow_up|new_topic|unclear",
+  "confidence": 0.0-1.0,
+  "reasoning": "explanation"
+}}
+"""
+    
+    result = registry.execute(
+        "llm",
+        prompt=prompt,
+        response_format="json",
+        temperature=0.3
+    )
+    
+    if not result.success:
+        # Default to new topic on error
+        return {
+            "conversation": {
+                "is_continuation": False,
+                "continuation_type": "new_topic",
+                "needs_reiteration": False
+            }
+        }
+    
+    data = result.data
+    is_continuation = data["continuation_type"] in ["refinement", "follow_up"]
+    
+    return {
+        "conversation": {
+            "is_continuation": is_continuation,
+            "previous_intent": last_turn.intent_detected,
+            "needs_reiteration": is_continuation,  # Reiterate if continuing
+            "continuation_type": data["continuation_type"]
+        }
+    }
+2. Intent Reiteration
+python
+# nodes/intent/intent_reiterator.py
+
+def reiterate_intent(
+    state: BIAgentState,
+    registry: ToolRegistry
+) -> dict:
+    """
+    When continuing conversation, merge new input with previous intent.
+    
+    Inputs:
+        - state.user_input (new refinement)
+        - state.memory (previous intent)
+        - state.conversation.continuation_type
+    
+    Outputs:
+        - intent (merged/refined intent)
+    
+    Tools:
+        - llm_tool
+    """
+    
+    user_input = state["user_input"]
+    memory = state["memory"]
+    continuation_type = state["conversation"]["continuation_type"]
+    
+    last_turn = memory.get_last_turn()
+    
+    if continuation_type == "refinement":
+        # User is modifying their previous request
+        prompt = f"""
+Previous query: {last_turn.user_message.content}
+Previous intent: {last_turn.intent_detected}
+Previous entities: {last_turn.entities_extracted}
+
+User refinement: {user_input}
+
+Merge the refinement into the previous intent. The user is MODIFYING their request.
+
+Examples:
+- Previous: "show shipments last week" + Refinement: "actually last month" 
+  → Intent: lookup, time_range: last month
+- Previous: "show MSC shipments" + Refinement: "add Maersk too"
+  → Intent: lookup, vessels: [MSC, Maersk]
+
+Respond with merged intent JSON:
+{{
+  "intent_type": "lookup|aggregation|comparison|trend",
+  "entities": {{}},
+  "time_range": {{}},
+  "confidence": 0.0-1.0
+}}
+"""
+    
+    elif continuation_type == "follow_up":
+        # User wants more info about previous results
+        prompt = f"""
+Previous query: {last_turn.user_message.content}
+Previous results returned: {last_turn.queries_executed}
+
+User follow-up: {user_input}
+
+The user wants additional information related to previous results.
+
+Examples:
+- Previous: "show shipments for MSC ANNA" + Follow-up: "what about containers?"
+  → Intent: lookup, entity: MSC ANNA, additional_info: containers
+- Previous: "count shipments by port" + Follow-up: "show me the details for Shanghai"
+  → Intent: lookup, port: Shanghai (drill-down from aggregation)
+
+Respond with follow-up intent JSON:
+{{
+  "intent_type": "lookup|aggregation|comparison|trend",
+  "entities": {{}},
+  "builds_on_previous": true,
+  "confidence": 0.0-1.0
+}}
+"""
+    
+    result = registry.execute(
+        "llm",
+        prompt=prompt,
+        response_format="json",
+        temperature=0.3
+    )
+    
+    if not result.success:
+        # Fall back to fresh classification
+        return {"error": "Intent reiteration failed, will re-classify"}
+    
+    return {
+        "intent": {
+            **result.data,
+            "is_reiteration": True
+        }
+    }
+3. Business Object Analysis
+python
+# nodes/query/business_object_analyzer.py
+
+def analyze_business_objects(
+    state: BIAgentState,
+    registry: ToolRegistry
+) -> dict:
+    """
+    Analyze which business objects are involved and if JOIN/GROUP needed.
+    
+    Inputs:
+        - state.intent (what user wants)
+        - state.resolution (resolved entities)
+    
+    Outputs:
+        - intent.business_objects
+        - intent.requires_join
+        - intent.requires_grouping
+        - intent.aggregation_type
+    
+    Tools:
+        - llm_tool (for complex analysis)
+    """
+    
+    intent = state["intent"]
+    resolution = state["resolution"]
+    
+    # Define business object mappings
+    ENTITY_TO_OBJECT = {
+        "vessel": "vessel",
+        "vessel_name": "vessel",
+        "imo": "vessel",
+        "port": "port",
+        "port_code": "port",
+        "shipment": "shipment",
+        "container": "container",
+        "bill_of_lading": "shipment",
+        "cargo": "cargo"
+    }
+    
+    # Identify business objects from entities
+    business_objects = set()
+    for entity_type in resolution["resolved_entities"].keys():
+        if entity_type in ENTITY_TO_OBJECT:
+            business_objects.add(ENTITY_TO_OBJECT[entity_type])
+    
+    business_objects = list(business_objects)
+    
+    # Determine if JOIN needed
+    requires_join = len(business_objects) > 1
+    
+    # Determine if aggregation needed
+    intent_type = intent["intent_type"]
+    requires_grouping = intent_type in ["aggregation", "comparison", "trend"]
+    
+    # Determine aggregation type
+    aggregation_type = None
+    if requires_grouping:
+        # Use LLM to identify aggregation type
+        prompt = f"""
+User query: {state['user_input']}
+Intent: {intent_type}
+
+What type of aggregation is needed?
+- "count" - counting records (e.g., "how many shipments")
+- "sum" - summing values (e.g., "total containers")
+- "avg" - averaging (e.g., "average transit time")
+- "min_max" - min/max (e.g., "latest shipment date")
+- "group_by" - group by dimension (e.g., "shipments by port")
+- "terms" - distinct values (e.g., "list all ports")
+
+Respond with JSON:
+{{
+  "aggregation_type": "count|sum|avg|min_max|group_by|terms",
+  "group_by_field": "field_name or null",
+  "aggregate_field": "field_name or null"
+}}
+"""
+        result = registry.execute(
+            "llm",
+            prompt=prompt,
+            response_format="json"
+        )
+        
+        if result.success:
+            aggregation_type = result.data["aggregation_type"]
+    
+    return {
+        "intent": {
+            "business_objects": business_objects,
+            "requires_join": requires_join,
+            "requires_grouping": requires_grouping,
+            "aggregation_type": aggregation_type
+        }
+    }
+4. Query Strategy Router
+python
+# routing/query_strategy_router.py
+
+def route_query_strategy(state: BIAgentState) -> str:
+    """
+    Route to appropriate query builder based on business object analysis.
+    
+    Decision logic:
+    - Single business object + no aggregation → GraphQL
+    - Multiple business objects (JOIN) → Elasticsearch
+    - Aggregation (GROUP BY) → Elasticsearch
+    - Complex mixed → Hybrid
+    """
+    
+    intent = state["intent"]
+    
+    requires_join = intent.get("requires_join", False)
+    requires_grouping = intent.get("requires_grouping", False)
+    business_objects = intent.get("business_objects", [])
+    
+    # JOIN or GROUP BY → must use Elasticsearch
+    if requires_join or requires_grouping:
+        return "elasticsearch"
+    
+    # Single object, simple lookup → GraphQL is better
+    if len(business_objects) == 1 and intent["intent_type"] == "lookup":
+        return "graphql"
+    
+    # Default to ES for complex cases
+    return "elasticsearch"
+5. ES Query Type Router
+python
+# routing/es_query_type_router.py
+
+def route_es_query_type(state: BIAgentState) -> str:
+    """
+    Route to search vs aggregation ES query builder.
+    
+    Decision:
+    - Aggregation intent → aggregation builder
+    - Lookup intent → search builder
+    """
+    
+    intent = state["intent"]
+    
+    if intent.get("requires_grouping") or intent.get("aggregation_type"):
+        return "build_es_aggregation"
+    else:
+        return "build_es_search"
+Updated Routing Logic
+python
+# routing/intent_router.py
+
+def route_after_conversation_detection(state: BIAgentState) -> str:
+    """Route after conversation type detection"""
+    
+    conversation = state["conversation"]
+    
+    if conversation["continuation_type"] == "unclear":
+        return "ask_continuation_clarification"
+    
+    elif conversation["is_continuation"]:
+        return "reiterate_intent"
+    
+    else:
+        return "classify_intent"
+
+def route_after_intent(state: BIAgentState) -> str:
+    """Route after intent classification/reiteration"""
+    
+    intent = state["intent"]
+    
+    if intent.get("requires_clarification"):
+        return "generate_clarification"
+    
+    else:
+        return "extract_entities"
+
+def route_after_business_analysis(state: BIAgentState) -> str:
+    """Route after business object analysis"""
+    
+    strategy = route_query_strategy(state)
+    
+    if strategy == "graphql":
+        return "build_graphql_query"
+    elif strategy == "elasticsearch":
+        return "route_es_type"
+    else:
+        return "plan_hybrid_query"
+Updated Graph Assembly
+python
+# graph.py
+
+def create_bi_graph(
+    tool_registry: ToolRegistry,
+    settings: Settings,
+    checkpointer
+) -> CompiledGraph:
+    """Assemble graph with conversation continuation support"""
+    
+    graph = StateGraph(BIAgentState)
+    
+    # === CONVERSATION PHASE ===
+    graph.add_node("detect_conversation_type", 
+                   lambda s: detect_conversation_type(s, tool_registry))
+    graph.add_node("reiterate_intent",
+                   lambda s: reiterate_intent(s, tool_registry))
+    graph.add_node("ask_continuation_clarification",
+                   generate_continuation_clarification)
+    
+    # === INTENT PHASE ===
+    graph.add_node("classify_intent",
+                   lambda s: classify_intent(s, tool_registry))
+    graph.add_node("extract_entities",
+                   lambda s: extract_entities(s, tool_registry))
+    
+    # === RESOLUTION PHASE ===
+    graph.add_node("resolve_entities",
+                   lambda s: resolve_entities(s, tool_registry))
+    
+    # === BUSINESS OBJECT ANALYSIS ===
+    graph.add_node("analyze_business_objects",
+                   lambda s: analyze_business_objects(s, tool_registry))
+    
+    # === QUERY BUILDING PHASE ===
+    graph.add_node("build_graphql_query",
+                   lambda s: build_graphql_query(s, tool_registry))
+    graph.add_node("build_es_search",
+                   lambda s: build_es_search_query(s, tool_registry))
+    graph.add_node("build_es_aggregation",
+                   lambda s: build_es_agg_query(s, tool_registry))
+    graph.add_node("validate_query",
+                   lambda s: validate_query(s, tool_registry))
+    
+    # === EXECUTION PHASE ===
+    graph.add_node("execute_query",
+                   lambda s: execute_query(s, tool_registry))
+    
+    # === RESPONSE PHASE ===
+    graph.add_node("format_response",
+                   lambda s: format_response(s, tool_registry))
+    graph.add_node("generate_response",
+                   lambda s: generate_response(s, tool_registry))
+    graph.add_node("generate_clarification",
+                   lambda s: generate_clarification(s, tool_registry))
+    
+    # === EDGES ===
+    
+    # Entry point
+    graph.set_entry_point("detect_conversation_type")
+    
+    # After conversation detection
+    graph.add_conditional_edges(
+        "detect_conversation_type",
+        route_after_conversation_detection,
+        {
+            "reiterate_intent": "reiterate_intent",
+            "classify_intent": "classify_intent",
+            "ask_continuation_clarification": "ask_continuation_clarification"
+        }
+    )
+    
+    # Clarification ends turn
+    graph.add_edge("ask_continuation_clarification", END)
+    
+    # Both paths converge to extract_entities
+    graph.add_edge("reiterate_intent", "extract_entities")
+    graph.add_edge("classify_intent", "extract_entities")
+    
+    # After intent
+    graph.add_conditional_edges(
+        "extract_entities",
+        route_after_intent,
+        {
+            "extract_entities": "resolve_entities",
+            "generate_clarification": "generate_clarification"
+        }
+    )
+    
+    # After resolution
+    graph.add_edge("resolve_entities", "analyze_business_objects")
+    
+    # After business analysis
+    graph.add_conditional_edges(
+        "analyze_business_objects",
+        route_after_business_analysis,
+        {
+            "build_graphql_query": "build_graphql_query",
+            "route_es_type": "route_es_type",  # Decision node
+            "plan_hybrid_query": "plan_hybrid_query"
+        }
+    )
+    
+    # ES type routing (inline decision node)
+    def route_es_type_node(state):
+        next_node = route_es_query_type(state)
+        return next_node
+    
+    graph.add_node("route_es_type", route_es_type_node)
+    
+    graph.add_conditional_edges(
+        "route_es_type",
+        lambda s: route_es_query_type(s),
+        {
+            "build_es_search": "build_es_search",
+            "build_es_aggregation": "build_es_aggregation"
+        }
+    )
+    
+    # All query builders → validate
+    graph.add_edge("build_graphql_query", "validate_query")
+    graph.add_edge("build_es_search", "validate_query")
+    graph.add_edge("build_es_aggregation", "validate_query")
+    
+    # Validate → execute
+    graph.add_edge("validate_query", "execute_query")
+    
+    # Execute → format → generate → END
+    graph.add_edge("execute_query", "format_response")
+    graph.add_edge("format_response", "generate_response")
+    graph.add_edge("generate_response", END)
+    
+    # Clarification → END
+    graph.add_edge("generate_clarification", END)
+    
+    return graph.compile(checkpointer=checkpointer)
+Summary of Changes
+1. Conversation Continuation
+New ConversationContext tracks if user is continuing previous query
+detect_conversation_type node identifies: refinement, follow-up, new topic
+reiterate_intent merges new input with previous intent
+2. Business Object Routing
+analyze_business_objects identifies which objects involved
+Single object → GraphQL (better for simple lookups)
+Multiple objects (JOIN) → Elasticsearch
+Aggregation (GROUP BY) → Elasticsearch
+3. ES Dual Path
+route_es_query_type decides search vs aggregation
+Search query builder for lookups
+Aggregation query builder for GROUP BY queries
+Context Purpose
+Each context (intent, resolution, query, execution) is an output of one phase
+Contexts provide clean data contracts between phases
+Avoids giant flat state - organized by responsibility
+Does this address your requirements? Would you like me to update the full design document and README?

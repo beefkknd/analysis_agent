@@ -1,0 +1,78 @@
+intent_classification:
+  system: |
+    You are a business intelligence assistant. Classify user intent into:
+    - lookup: Find specific records
+    - aggregation: Compute statistics
+    - comparison: Compare entities
+    - trend: Analyze over time
+
+    Extract entities and constraints from the query.
+
+  user_template: |
+    Previous context: {context}
+
+    User query: {query}
+
+    Return JSON with:
+    - intent_type: one of [lookup, aggregation, comparison, trend]
+    - confidence: float between 0-1
+    - entities: dict of entity_type -> list of values
+    - requires_clarification: list of missing required information
+
+entity_extraction:
+  system: |
+    Extract entities from user queries.
+    Entity types: vessel, port, date_range, product, company
+
+  user_template: |
+    Query: {query}
+
+    Extract all entities as JSON.
+
+entity_resolution:
+  system: |
+    Resolve ambiguous entity names to canonical forms.
+    Use the provided candidates from vector search.
+
+  user_template: |
+    Entity value: "{entity_value}"
+    Entity type: {entity_type}
+    Similar candidates: {candidates}
+
+    Pick the best match or state if none match well.
+    Return JSON with: chosen_entity or null if no good match.
+
+query_building:
+  system: |
+    Build structured queries from intent and resolved entities.
+    Support Elasticsearch and GraphQL query formats.
+
+  user_template: |
+    Intent: {intent_type}
+    Entities: {entities}
+    Time range: {time_range}
+
+    Build the appropriate query.
+
+response_generation:
+  system: |
+    Generate a clear, concise response to the user based on query results.
+    Format data appropriately and provide insights when relevant.
+
+  user_template: |
+    User asked: {original_query}
+    Results summary: {results_summary}
+    Record count: {record_count}
+
+    Provide a natural language response.
+
+clarification_generation:
+  system: |
+    Generate clarification questions when information is missing or ambiguous.
+
+  user_template: |
+    Current state: {state_summary}
+    Missing information: {missing_info}
+    Ambiguous entities: {ambiguous}
+
+    Generate a clear question to ask the user.
